@@ -5,7 +5,8 @@ from typing import Optional, Dict, Any, List, Tuple
 import os
 import json
 import requests
-from bs4 import BeautifulSoup  # ESPN / CBS / NBC
+from bs4 import BeautifulSoup
+import unicodedata
 
 app = FastAPI()
 
@@ -31,7 +32,6 @@ def root():
     return {"message": "NBA injuries API is running"}
 
 
-# Endpoint de test factice
 @app.get("/injuries/test")
 def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
     player_name = player or "LeBron James"
@@ -54,11 +54,11 @@ def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
                 "url": "https://www.cbssports.com/nba/injuries/",
             },
             "nbc": {
-                "status": "out",
+                "status": "injury_news",
                 "injury": "ankle",
-                "details": "Likely to miss multiple games",
+                "details": "Rotoworld injury note",
                 "last_update": "2025-12-01T18:40:00Z",
-                "url": "https://www.nbcsports.com/nba/nba-injuries-nbc-sports",
+                "url": "https://www.nbcsports.com/fantasy/basketball/player-news",
             },
             "balldontlie": {
                 "status": "out",
@@ -71,6 +71,21 @@ def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
     }
 
     return example_response
+
+
+# ============================================================
+#                    HELPERS GÉNÉRAUX
+# ============================================================
+
+def _normalize_str(s: str) -> str:
+    """
+    Minuscule + suppression des accents/diacritiques.
+    Exemple : 'Kristaps Porziņģis' -> 'kristaps porzingis'.
+    """
+    s = s or ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.lower()
 
 
 # ============================================================
@@ -437,148 +452,137 @@ def injuries_espn() -> Dict[str, Any]:
 
 
 # ============================================================
-#                            NBC
+#                            NBC (Rotoworld)
 # ============================================================
 
-# Page injuries NBC actuelle (route "Injuries" dans le menu NBA). [web:156]
-NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba-injuries-nbc-sports"
+# On utilise la page Rotoworld "NBA Player News" comme source NBC. [web:14]
+NBC_NEWS_URL = "https://www.nbcsports.com/fantasy/basketball/player-news"
 
 
-def _fetch_nbc_html() -> str:
+def _fetch_nbc_news_html() -> str:
     try:
         resp = requests.get(
-            NBC_INJURIES_URL,
+            NBC_NEWS_URL,
             timeout=15,
             headers={"User-Agent": "Mozilla/5.0"},
         )
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error calling NBC: {e}")
+        raise HTTPException(status_code=502, detail=f"Error calling NBC Rotoworld: {e}")
 
     if resp.status_code != 200:
         raise HTTPException(
             status_code=resp.status_code,
-            detail=f"NBC error: {resp.text[:200]}",
+            detail=f"NBC Rotoworld error: {resp.text[:200]}",
         )
 
     return resp.text
 
 
-def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
+def _find_nbc_news_for_player(query_name: str, max_items: int = 3) -> List[Dict[str, Any]]:
     """
-    Parse la page injuries NBC en texte brut.
-    Structure globale : menu, listes d'équipes, puis section "Injuries" avec
-    pour chaque équipe un bloc : TEAM, puis headers PLAYER/POS/DATE/INJURY
-    puis des blocs (name, pos, date, injury, description). [web:156]
+    Recherche dans la page "NBA Player News" les blocs de texte qui contiennent
+    le nom du joueur (normalisé, sans accents), et renvoie quelques items. [web:14]
+
+    Comme la structure HTML peut évoluer, on reste sur un parsing texte robuste :
+    - on récupère tout le texte,
+    - on se limite à la section à partir de "NBA Player News",
+    - on cherche le nom normalisé dans les lignes,
+    - pour chaque match, on renvoie le headline + 5 lignes de contexte.
     """
+    html = _fetch_nbc_news_html()
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n", strip=True)
     lines = [l for l in text.split("\n") if l.strip()]
 
-    results: List[Dict[str, Any]] = []
-
-    try:
-        start_idx = lines.index("Injuries")
-    except ValueError:
-        try:
-            start_idx = lines.index("INJURIES")
-        except ValueError:
-            return results
-
-    header_tokens = {"PLAYER", "Pos", "POS", "Date", "DATE", "Injury", "INJURY"}
-    positions = {
-        "PG", "SG", "SF", "PF", "C",
-        "G", "F",
-        "G-F", "F-G", "G/F", "F/C", "C/F",
-    }
-
-    i = start_idx
-    current_team: Optional[str] = None
-
-    def looks_like_team_header(idx: int) -> bool:
-        if idx + 4 >= len(lines):
-            return False
-        l0 = lines[idx].strip()
-        l1 = lines[idx + 1].strip()
-        l2 = lines[idx + 2].strip()
-        l3 = lines[idx + 3].strip()
-        l4 = lines[idx + 4].strip()
-        return (
-            l0 not in header_tokens
-            and l1 in {"PLAYER", "Player"}
-            and l2 in {"POS", "Pos"}
-            and l3 in {"DATE", "Date"}
-            and l4 in {"INJURY", "Injury"}
-        )
-
-    while i < len(lines) - 5:
-        if looks_like_team_header(i):
-            current_team = lines[i].strip()
-            i += 5
-            continue
-
-        if current_team is None:
-            i += 1
-            continue
-
-        if i + 4 >= len(lines):
+    # On se limite à partir de "NBA Player News" pour éviter les menus. [web:14]
+    start_idx = 0
+    for idx, line in enumerate(lines):
+        if _normalize_str(line) == _normalize_str("NBA Player News"):
+            start_idx = idx
             break
 
-        name = lines[i].strip()
-        pos = lines[i + 1].strip()
-        date = lines[i + 2].strip()
-        injury = lines[i + 3].strip()
-        desc = lines[i + 4].strip()
+    norm_query = _normalize_str(query_name)
+    results: List[Dict[str, Any]] = []
 
-        if (
-            name in header_tokens
-            or pos in header_tokens
-            or date in header_tokens
-            or injury in header_tokens
-        ):
+    i = start_idx
+    n = len(lines)
+    while i < n and len(results) < max_items:
+        line = lines[i]
+        if norm_query and norm_query in _normalize_str(line):
+            # On considère cette ligne comme "headline" de la news.
+            headline = line.strip()
+
+            # Contexte : quelques lignes suivantes, jusqu'à une ligne vide
+            # ou un séparateur évident, ou max 6 lignes.
+            context_lines: List[str] = []
+            j = i + 1
+            while j < n and len(context_lines) < 6:
+                l2 = lines[j].strip()
+                if not l2:
+                    break
+                # On s'arrête si on retombe sur "NBA Player News" ou un gros header.
+                if _normalize_str(l2) in {
+                    _normalize_str("NBA Player News"),
+                    _normalize_str("NFL Player News"),
+                    _normalize_str("MLB Player News"),
+                }:
+                    break
+                context_lines.append(l2)
+                j += 1
+
+            summary = " ".join(context_lines).strip()
+            results.append(
+                {
+                    "player_query": query_name,
+                    "headline": headline,
+                    "summary": summary,
+                    "raw_block": "\n".join([headline] + context_lines),
+                    "source": "nbc_rotoworld",
+                }
+            )
+            i = j
+        else:
             i += 1
-            continue
-
-        if pos not in positions:
-            i += 1
-            continue
-
-        results.append(
-            {
-                "player_name": name,
-                "position": pos,
-                "date": date,
-                "injury": injury,
-                "description": desc,
-                "team": current_team,
-                "source": "nbc",
-            }
-        )
-        i += 5
 
     return results
 
 
 @app.get("/nbc/raw")
 def nbc_raw() -> Dict[str, Any]:
-    html = _fetch_nbc_html()
+    html = _fetch_nbc_news_html()
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n", strip=True)
     return {
-        "source": "nbc",
-        "url": NBC_INJURIES_URL,
+        "source": "nbc_rotoworld",
+        "url": NBC_NEWS_URL,
         "status_code": 200,
         "content_snippet": text[:500],
     }
 
 
 @app.get("/injuries/nbc")
-def injuries_nbc() -> Dict[str, Any]:
-    html = _fetch_nbc_html()
-    parsed = _parse_nbc_injuries(html)
+def injuries_nbc(name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Si name est fourni, renvoie les blocs Rotoworld NBA Player News correspondant.
+    Sinon, renvoie juste un snippet de la page.
+    """
+    if not name:
+        html = _fetch_nbc_news_html()
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text("\n", strip=True)
+        return {
+            "source": "nbc_rotoworld",
+            "url": NBC_NEWS_URL,
+            "mode": "snippet_only",
+            "content_snippet": text[:500],
+        }
+
+    news = _find_nbc_news_for_player(name, max_items=5)
     return {
-        "source": "nbc",
-        "count": len(parsed),
-        "injuries": parsed,
+        "source": "nbc_rotoworld",
+        "player_query": name,
+        "count": len(news),
+        "items": news,
     }
 
 
@@ -705,7 +709,7 @@ def _normalize_full_name(p: Dict[str, Any]) -> str:
         first = (p.get("first_name") or "").strip()
         last = (p.get("last_name") or "").strip()
         full = f"{first} {last}".strip()
-    return " ".join(full.lower().split())
+    return _normalize_str(full)
 
 
 def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -723,7 +727,7 @@ def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[D
     seen_ids = set()
     all_found: List[Dict[str, Any]] = []
     best_player: Optional[Dict[str, Any]] = None
-    query_norm = " ".join(name.lower().split())
+    query_norm = _normalize_str(name)
 
     for term in candidates:
         params = {"search": term, "per_page": 10}
@@ -769,7 +773,7 @@ def _compute_aggregated_status(
     if cbs_matches:
         sources_with_info.append("cbs")
     if nbc_matches:
-        sources_with_info.append("nbc")
+        sources_with_info.append("nbc_rotoworld")
 
     status = "flagged" if sources_with_info else "clear"
 
@@ -785,27 +789,27 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
     if not query:
         raise HTTPException(status_code=400, detail="name parameter must not be empty")
 
-    query_lower = query.lower()
+    query_norm = _normalize_str(query)
 
     # ESPN
     espn_html = _fetch_espn_html()
     espn_all = _parse_espn_injuries(espn_html)
     espn_matches = [
-        item for item in espn_all if query_lower in item["player_name"].lower()
+        item
+        for item in espn_all
+        if query_norm in _normalize_str(item["player_name"])
     ]
 
-    # NBC
-    nbc_html = _fetch_nbc_html()
-    nbc_all = _parse_nbc_injuries(nbc_html)
-    nbc_matches = [
-        item for item in nbc_all if query_lower in item["player_name"].lower()
-    ]
+    # NBC = Rotoworld Player News
+    nbc_news_matches = _find_nbc_news_for_player(query, max_items=3)
 
     # CBS
     cbs_html = _fetch_cbs_html()
     cbs_all = _parse_cbs_injuries(cbs_html)
     cbs_matches = [
-        item for item in cbs_all if query_lower in item["player_name"].lower()
+        item
+        for item in cbs_all
+        if query_norm in _normalize_str(item["player_name"])
     ]
 
     # BallDontLie
@@ -845,7 +849,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
         bdl_injuries=bdl_injuries,
         espn_matches=espn_matches,
         cbs_matches=cbs_matches,
-        nbc_matches=nbc_matches,
+        nbc_matches=nbc_news_matches,
     )
 
     return {
@@ -862,8 +866,8 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
                 "total_injuries_checked": len(espn_all),
             },
             "nbc": {
-                "injuries": nbc_matches,
-                "total_injuries_checked": len(nbc_all),
+                "injuries": nbc_news_matches,
+                "total_items_checked": None,
             },
             "cbs": {
                 "injuries": cbs_matches,
@@ -899,9 +903,7 @@ def widget() -> str:
         "Segoe UI", sans-serif;
     }}
     * {{ box-sizing: border-box; }}
-    #injury-app {{
-      color: #e5e7eb;
-    }}
+    #injury-app {{ color: #e5e7eb; }}
     .ia-shell {{
       max-width: 1040px;
       margin: 0 auto;
@@ -990,9 +992,7 @@ def widget() -> str:
       font-size: 14px;
       outline: none;
     }}
-    #ia-player-input::placeholder {{
-      color: #6b7280;
-    }}
+    #ia-player-input::placeholder {{ color: #6b7280; }}
     #ia-player-input:focus {{
       border-color: #60a5fa;
       box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.7);
@@ -1063,9 +1063,7 @@ def widget() -> str:
     .ia-suggestion-item:hover {{
       background: rgba(37, 99, 235, 0.25);
     }}
-    .ia-suggestion-name {{
-      font-weight: 500;
-    }}
+    .ia-suggestion-name {{ font-weight: 500; }}
     .ia-suggestion-meta {{
       color: #9ca3af;
       font-size: 12px;
@@ -1228,9 +1226,7 @@ def widget() -> str:
       font-size: 11px;
       color: #9ca3af;
     }}
-    .ia-status {{
-      font-weight: 500;
-    }}
+    .ia-status {{ font-weight: 500; }}
     .ia-meta {{
       font-size: 12px;
       color: #9ca3af;
@@ -1335,7 +1331,7 @@ def widget() -> str:
         </div>
 
         <p class="ia-footer">
-          Données live : BallDontLie, ESPN, CBS, NBC.
+          Données live : BallDontLie, ESPN, CBS, NBC (Rotoworld).
         </p>
       </div>
     </div>
@@ -1520,9 +1516,7 @@ def widget() -> str:
         playerCard.style.display = "none";
 
         try {{
-          const url =
-            "/injuries/by-player?name=" +
-            encodeURIComponent(name);
+          const url = "/injuries/by-player?name=" + encodeURIComponent(name);
           const res = await fetch(url, {{ method: "GET" }});
           if (!res.ok) {{
             throw new Error("API error " + res.status);
@@ -1531,9 +1525,7 @@ def widget() -> str:
           renderResults(data);
         }} catch (e) {{
           console.error(e);
-          setError(
-            "Impossible de récupérer les données de blessures."
-          );
+          setError("Impossible de récupérer les données de blessures.");
         }} finally {{
           setLoading(false);
         }}
@@ -1665,17 +1657,13 @@ def widget() -> str:
         if (!nbcInj) {{
           renderEmpty(srcNbc);
         }} else {{
-          const team = nbcInj.team || "";
-          const date = nbcInj.date || "";
-          const desc = nbcInj.description || "";
           srcNbc.innerHTML =
-            '<p class="ia-status">NBC injury report</p>' +
-            '<p class="ia-meta">' +
-            (nbcInj.injury || "Injury non précisée") +
-            (date ? " · " + date : "") +
-            (team ? " · " + team : "") +
-            (desc ? " · " + desc : "") +
-            "</p>";
+            '<p class="ia-status">' +
+            (nbcInj.headline || "NBC Rotoworld") +
+            "</p>" +
+            (nbcInj.summary
+              ? '<p class="ia-meta">' + nbcInj.summary + "</p>"
+              : "");
         }}
       }}
 
