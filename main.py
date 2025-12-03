@@ -22,11 +22,6 @@ def root():
 
 @app.get("/injuries/test")
 def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Endpoint de test qui montre la structure finale pour un joueur :
-    - une entrée par source (espn, cbs, nbc, balldontlie)
-    - données 100 % factices pour l’instant.
-    """
     player_name = player or "LeBron James"
 
     example_response = {
@@ -83,9 +78,6 @@ def _call_balldontlie(
     params: Optional[Dict[str, Any]] = None,
     timeout: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Appelle un endpoint BallDontLie donné (path = '/v1/xxx') et renvoie le JSON. [web:101]
-    """
     api_key = _get_balldontlie_api_key()
     base_url = "https://api.balldontlie.io"
     url = f"{base_url}{path}"
@@ -109,9 +101,6 @@ def _call_balldontlie(
 
 @app.get("/balldontlie/raw")
 def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[str, Any]:
-    """
-    Renvoie les données brutes de BallDontLie pour les blessures (JSON complet). [web:101]
-    """
     params: Dict[str, Any] = {"per_page": per_page}
     if cursor is not None:
         params["cursor"] = cursor
@@ -127,16 +116,15 @@ def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[st
 
 def _map_balldontlie_injury(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Transforme un enregistrement brut de BallDontLie en format simplifié. [web:43][web:101]
+    Ici, item est déjà un objet injury (sans wrapper data). [web:101]
     """
     player = item.get("player") or {}
-    team_id = player.get("team_id")
-
+    team = player.get("team") or {}
     return {
         "player_id": player.get("id"),
-        "player_name": player.get("full_name"),   # peut être null selon le schéma réel [web:43]
-        "team_id": team_id,
-        "team_name": None,                        # à remplir plus tard via /teams si besoin [web:43]
+        "player_name": player.get("full_name"),
+        "team_id": team.get("id"),
+        "team_name": team.get("full_name") or team.get("name"),
         "status": item.get("status"),
         "injury": item.get("injury"),
         "description": item.get("description"),
@@ -151,9 +139,6 @@ def injuries_balldontlie(
     per_page: int = 25,
     cursor: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Renvoie les blessures BallDontLie dans un format simplifié pour le dashboard. [web:101]
-    """
     params: Dict[str, Any] = {"per_page": per_page}
     if cursor is not None:
         params["cursor"] = cursor
@@ -172,20 +157,28 @@ def injuries_balldontlie(
     }
 
 
-# ---------- BallDontLie : infos joueur par ID ----------
+# ---------- BallDontLie : infos joueur par ID (corrigé) ----------
 
 @app.get("/balldontlie/player/{player_id}")
 def balldontlie_player(player_id: int) -> Dict[str, Any]:
     """
-    Renvoie les infos d’un joueur (nom, équipe, etc.) à partir de son ID BallDontLie. [web:101]
+    BallDontLie renvoie un wrapper {"data": {...}} pour /v1/players/{id}. [web:101][file:1]
+    On doit donc lire resp["data"] avant de sortir les champs.
     """
-    data = _call_balldontlie(f"/v1/players/{player_id}")
-    # Schéma typique /v1/players : id, full_name, first_name, last_name, team, etc. [web:101][web:28]
+    resp = _call_balldontlie(f"/v1/players/{player_id}")
+    data = resp.get("data") or {}
+
     player_team = data.get("team") or {}
+
+    full_name = data.get("full_name")
+    if not full_name:
+        first = data.get("first_name") or ""
+        last = data.get("last_name") or ""
+        full_name = f"{first} {last}".strip()
 
     return {
         "id": data.get("id"),
-        "full_name": data.get("full_name") or f"{data.get('first_name', '')} {data.get('last_name', '')}".strip(),
+        "full_name": full_name,
         "first_name": data.get("first_name"),
         "last_name": data.get("last_name"),
         "position": data.get("position"),
@@ -195,7 +188,7 @@ def balldontlie_player(player_id: int) -> Dict[str, Any]:
             "abbreviation": player_team.get("abbreviation"),
             "city": player_team.get("city"),
         },
-        "raw": data,
+        "raw": resp,
     }
 
 
@@ -206,11 +199,6 @@ def injuries_balldontlie_by_player_id(
     player_id: int,
     per_page: int = 50,
 ) -> Dict[str, Any]:
-    """
-    Renvoie les blessures BallDontLie pour un joueur spécifique (par player_id). [web:101]
-    On filtre côté API sur l’ID du joueur.
-    """
-    # Selon la doc, on peut souvent filtrer par paramètres (exemple générique) [web:101][web:28].
     params: Dict[str, Any] = {
         "per_page": per_page,
         "player_id": player_id,
