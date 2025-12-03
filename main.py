@@ -219,19 +219,18 @@ def injuries_balldontlie_by_player_id(
     }
 
 
-# ---------- ESPN : récupération brute de la page ----------
+# ---------- ESPN : helpers ----------
 
-ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"  # page principale des blessures. [web:20]
+ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"  # page principale des blessures [web:20]
 
 
-@app.get("/espn/raw")
-def espn_raw() -> Dict[str, Any]:
-    """
-    Récupère l'HTML brut de la page ESPN injuries.
-    Étape 1 : juste pour vérifier qu'on atteint bien la page depuis Render. [web:20]
-    """
+def _fetch_espn_html() -> str:
     try:
-        resp = requests.get(ESPN_INJURIES_URL, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(
+            ESPN_INJURIES_URL,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Error calling ESPN: {e}")
 
@@ -241,10 +240,99 @@ def espn_raw() -> Dict[str, Any]:
             detail=f"ESPN error: {resp.text[:200]}",
         )
 
-    # On ne renvoie pas tout l'HTML (trop gros), juste quelques infos de debug.
+    return resp.text
+
+
+def _parse_espn_injuries(html: str) -> List[Dict[str, Any]]:
+    """
+    Parse les tableaux ESPN (NAME / POS / EST. RETURN DATE / STATUS / COMMENT). [file:2][web:20]
+    On renvoie une liste d'objets simples :
+    - team_name (si détectable plus tard)
+    - player_name
+    - position
+    - est_return_date
+    - status
+    - comment
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    results: List[Dict[str, Any]] = []
+
+    # Sur la page ESPN, les tables d'injuries sont rendues dans des balises <table>.
+    tables = soup.find_all("table")
+    for table in tables:
+        # Récupérer les headers de la table
+        headers = [th.get_text(strip=True) for th in table.find_all("th")]
+        if not headers:
+            continue
+
+        # On cherche les tables avec les colonnes attendues.
+        wanted_headers = ["NAME", "POS", "EST. RETURN DATE", "STATUS", "COMMENT"]
+        if not all(h in headers for h in wanted_headers):
+            continue
+
+        # Indices des colonnes
+        idx_name = headers.index("NAME")
+        idx_pos = headers.index("POS")
+        idx_return = headers.index("EST. RETURN DATE")
+        idx_status = headers.index("STATUS")
+        idx_comment = headers.index("COMMENT")
+
+        # Parcourir les lignes de joueurs
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 5:
+                continue
+
+            name = cells[idx_name].get_text(strip=True)
+            pos = cells[idx_pos].get_text(strip=True)
+            est_return = cells[idx_return].get_text(strip=True)
+            status = cells[idx_status].get_text(strip=True)
+            comment = cells[idx_comment].get_text(strip=True)
+
+            if not name or name == "NAME":
+                continue  # ignorer les entêtes répétées
+
+            results.append(
+                {
+                    "player_name": name,
+                    "position": pos,
+                    "est_return_date": est_return,
+                    "status": status,
+                    "comment": comment,
+                    "source": "espn",
+                }
+            )
+
+    return results
+
+
+# ---------- ESPN : endpoints ----------
+
+@app.get("/espn/raw")
+def espn_raw() -> Dict[str, Any]:
+    """
+    Récupère un snippet HTML de la page ESPN injuries (déjà testé). [web:20]
+    """
+    html = _fetch_espn_html()
     return {
         "source": "espn",
         "url": ESPN_INJURIES_URL,
-        "status_code": resp.status_code,
-        "content_snippet": resp.text[:500],
+        "status_code": 200,
+        "content_snippet": html[:500],
+    }
+
+
+@app.get("/injuries/espn")
+def injuries_espn() -> Dict[str, Any]:
+    """
+    Renvoie les blessures ESPN dans un format simplifié, séparé de BallDontLie. [file:2][web:20]
+    """
+    html = _fetch_espn_html()
+    parsed = _parse_espn_injuries(html)
+
+    return {
+        "source": "espn",
+        "count": len(parsed),
+        "injuries": parsed,
     }
