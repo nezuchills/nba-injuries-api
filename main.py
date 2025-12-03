@@ -4,12 +4,13 @@ from fastapi.responses import HTMLResponse
 from typing import Optional, Dict, Any, List, Tuple
 import os
 import json
+import time
 import requests
-from bs4 import BeautifulSoup  # parser HTML (ESPN, NBC, CBS)
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright  # pour NBC
 
 app = FastAPI()
 
-# CORS : autorise les appels extérieurs (utile si tu veux d'autres frontends plus tard).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -285,10 +286,6 @@ ACTIVE_PLAYERS_LOADED: bool = False
 
 
 def _load_active_players() -> None:
-    """
-    Charge tous les joueurs actifs via /v1/players/active (BallDontLie),
-    avec pagination par cursor.
-    """
     global ACTIVE_PLAYERS, ACTIVE_PLAYERS_LOADED
     if ACTIVE_PLAYERS_LOADED:
         return
@@ -339,9 +336,6 @@ def _load_active_players() -> None:
 
 @app.get("/players/active/local")
 def players_active_local() -> Dict[str, Any]:
-    """
-    Retourne la liste en cache des joueurs actifs (pour auto-complétion).
-    """
     _load_active_players()
     return {
         "source": "balldontlie",
@@ -449,17 +443,39 @@ def injuries_espn() -> Dict[str, Any]:
 
 
 # ============================================================
-#                            NBC
+#                            NBC (Playwright)
 # ============================================================
 
-NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba/injuries"  # URL injuries actuelle [web:18]
+NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba/injuries"  # page dynamique [web:18]
+
+NBC_CACHE: Dict[str, Any] = {"data": None, "timestamp": 0.0}
+NBC_CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
-def _fetch_nbc_html() -> str:
+def _fetch_nbc_text() -> str:
+    """
+    Utilise Playwright pour charger la page NBC (JS exécuté) puis récupère innerText du body.
+    Fallback sur requests si Playwright échoue ou n'est pas dispo.
+    """
+    use_playwright = os.getenv("NBC_USE_PLAYWRIGHT", "true").lower() == "true"
+    if use_playwright:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(NBC_INJURIES_URL, wait_until="networkidle", timeout=30000)
+                text = page.inner_text("body")
+                browser.close()
+                return text
+        except Exception as e:
+            # En cas d'échec, on log et on retombe sur requests
+            print(f"[NBC] Playwright failed: {e}")
+
+    # Fallback: HTML brut (souvent sans données complètes, mais mieux que rien)
     try:
         resp = requests.get(
             NBC_INJURIES_URL,
-            timeout=10,
+            timeout=15,
             headers={"User-Agent": "Mozilla/5.0"},
         )
     except requests.RequestException as e:
@@ -471,19 +487,18 @@ def _fetch_nbc_html() -> str:
             detail=f"NBC error: {resp.text[:200]}",
         )
 
-    return resp.text
+    # On prend le texte, même si incomplet
+    soup = BeautifulSoup(resp.text, "html.parser")
+    return soup.get_text("\n", strip=True)
 
 
-def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
+def _parse_nbc_injuries_from_text(text: str) -> List[Dict[str, Any]]:
     """
     Parse la page injuries NBC en texte brut.
-    Schéma dans le contenu :
-    INJURIES -> All teams -> <TEAM> -> PLAYER / POS / DATE / INJURY -> lignes joueur. [web:18]
+    Schéma dans le contenu rendu :
+    INJURIES -> All teams -> <TEAM> -> PLAYER / POS / DATE / INJURY + ligne de description, répété. [web:18]
     """
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    lines = [l for l in text.split("\n") if l]
-
+    lines = [l for l in text.split("\n") if l.strip()]
     results: List[Dict[str, Any]] = []
 
     try:
@@ -516,15 +531,14 @@ def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
     while i < len(lines) - 5:
         # Détection d'un nouveau bloc équipe
         if looks_like_header(i):
-            current_team = lines[i]
-            i += 5  # on saute TEAM + PLAYER POS DATE INJURY
+            current_team = lines[i].strip()
+            i += 5  # TEAM + PLAYER POS DATE INJURY
             continue
 
         if current_team is None:
             i += 1
             continue
 
-        # On essaye de récupérer un bloc joueur : name, pos, date, injury, description
         if i + 4 >= len(lines):
             break
 
@@ -534,7 +548,7 @@ def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
         injury = lines[i + 3].strip()
         desc = lines[i + 4].strip()
 
-        # Si on retombe sur un header ou sur un truc qui ressemble pas à un joueur, on avance
+        # Évite de confondre avec les headers
         if (
             name in header_tokens
             or pos in header_tokens
@@ -544,7 +558,7 @@ def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
             i += 1
             continue
 
-        # Filtre très basique sur la position pour éviter de parser n'importe quoi
+        # Filtre sur position pour éviter des faux positifs
         if pos not in positions:
             i += 1
             continue
@@ -565,22 +579,32 @@ def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
     return results
 
 
+def _get_nbc_injuries_cached() -> List[Dict[str, Any]]:
+    now = time.time()
+    if NBC_CACHE["data"] is not None and now - NBC_CACHE["timestamp"] < NBC_CACHE_TTL_SECONDS:
+        return NBC_CACHE["data"]
+
+    text = _fetch_nbc_text()
+    parsed = _parse_nbc_injuries_from_text(text)
+    NBC_CACHE["data"] = parsed
+    NBC_CACHE["timestamp"] = now
+    return parsed
+
+
 @app.get("/nbc/raw")
 def nbc_raw() -> Dict[str, Any]:
-    html = _fetch_nbc_html()
+    text = _fetch_nbc_text()
     return {
         "source": "nbc",
         "url": NBC_INJURIES_URL,
         "status_code": 200,
-        "content_snippet": html[:500],
+        "content_snippet": text[:500],
     }
 
 
 @app.get("/injuries/nbc")
 def injuries_nbc() -> Dict[str, Any]:
-    html = _fetch_nbc_html()
-    parsed = _parse_nbc_injuries(html)
-
+    parsed = _get_nbc_injuries_cached()
     return {
         "source": "nbc",
         "count": len(parsed),
@@ -768,11 +792,6 @@ def _compute_aggregated_status(
     cbs_matches: List[Dict[str, Any]],
     nbc_matches: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    Règle simple :
-    - Si BallDontLie, ESPN, CBS ou NBC renvoie au moins une entrée -> status = "flagged".
-    - Sinon -> "clear".
-    """
     sources_with_info: List[str] = []
     if bdl_injuries:
         sources_with_info.append("balldontlie")
@@ -794,12 +813,8 @@ def _compute_aggregated_status(
 @app.get("/injuries/by-player")
 def injuries_by_player(name: str) -> Dict[str, Any]:
     """
-    Agrège les infos par joueur sans les fusionner :
-    - BallDontLie : joueur correspondant + blessures associées.
-    - ESPN : lignes d'injuries dont le nom matche.
-    - NBC : lignes d'injuries dont le nom matche.
-    - CBS : lignes d'injuries dont le nom matche.
-    + champ aggregated.status pour le ticker.
+    Agrège les infos par joueur :
+    - BallDontLie, ESPN, NBC, CBS.
     """
     query = name.strip()
     if not query:
@@ -817,8 +832,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
     ]
 
     # NBC
-    nbc_html = _fetch_nbc_html()
-    nbc_all = _parse_nbc_injuries(nbc_html)
+    nbc_all = _get_nbc_injuries_cached()
     nbc_matches = [
         item
         for item in nbc_all
@@ -905,10 +919,6 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
 
 @app.get("/widget", response_class=HTMLResponse)
 def widget() -> str:
-    """
-    Widget HTML autonome (dark, auto-complétion via cache,
-    statut agrégé, bouton de réveil + reset).
-    """
     _load_active_players()
     players_json = json.dumps(ACTIVE_PLAYERS)
 
@@ -1765,12 +1775,14 @@ def widget() -> str:
         }} else {{
           const team = nbcInj.team || "";
           const date = nbcInj.date || "";
+          const desc = nbcInj.description || "";
           srcNbc.innerHTML =
             '<p class="ia-status">NBC injury report</p>' +
             '<p class="ia-meta">' +
             (nbcInj.injury || "Injury non précisée") +
             (date ? " · " + date : "") +
             (team ? " · " + team : "") +
+            (desc ? " · " + desc : "") +
             "</p>";
         }}
       }}
