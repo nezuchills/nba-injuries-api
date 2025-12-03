@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import os
 import requests
 from bs4 import BeautifulSoup  # parser HTML ESPN
@@ -382,6 +382,71 @@ def injuries_espn() -> Dict[str, Any]:
 
 
 # ============================================================
+#           HELPER: meilleure correspondance joueur BDL
+# ============================================================
+
+def _normalize_full_name(p: Dict[str, Any]) -> str:
+    full = p.get("full_name")
+    if not full:
+        first = (p.get("first_name") or "").strip()
+        last = (p.get("last_name") or "").strip()
+        full = f"{first} {last}".strip()
+    return " ".join(full.lower().split())
+
+
+def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Essaie plusieurs termes pour trouver le meilleur joueur dans BallDontLie :
+    - d'abord le nom complet
+    - puis le dernier mot (souvent le nom de famille)
+    - puis le premier mot si besoin. [web:101][web:139]
+    """
+    name = name.strip()
+    if not name:
+        return None, []
+
+    tokens = name.split()
+    candidates = [name]
+    if len(tokens) >= 1:
+        candidates.append(tokens[-1])  # nom de famille
+    if len(tokens) >= 2:
+        candidates.append(tokens[0])   # prénom
+
+    seen_ids = set()
+    all_found: List[Dict[str, Any]] = []
+    best_player: Optional[Dict[str, Any]] = None
+    query_norm = " ".join(name.lower().split())
+
+    for term in candidates:
+        params = {"search": term, "per_page": 10}
+        resp = _call_balldontlie("/v1/players", params=params)
+        data = resp.get("data", [])
+
+        # Ajouter aux résultats cumulés (en évitant les doublons)
+        for p in data:
+            pid = p.get("id")
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            all_found.append(p)
+
+        # Chercher un match exact sur le nom normalisé
+        for p in data:
+            if _normalize_full_name(p) == query_norm:
+                best_player = p
+                break
+
+        if best_player is not None:
+            break
+
+    # Si rien d'exact, prendre le premier trouvé (s'il y en a)
+    if best_player is None and all_found:
+        best_player = all_found[0]
+
+    return best_player, all_found
+
+
+# ============================================================
 #                  ENDPOINT MULTI-SOURCES PAR JOUEUR
 # ============================================================
 
@@ -407,45 +472,23 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
         if query_lower in item["player_name"].lower()
     ]
 
-    # 2) BallDontLie : on refait la même requête que /players/balldontlie/search [web:101][web:139]
-    params = {"search": query, "per_page": 10}
-    players_resp = _call_balldontlie("/v1/players", params=params)
-    players_data = players_resp.get("data", [])
-
-    def _normalize_full_name(p: Dict[str, Any]) -> str:
-        full = p.get("full_name")
-        if not full:
-            first = (p.get("first_name") or "").strip()
-            last = (p.get("last_name") or "").strip()
-            full = f"{first} {last}".strip()
-        return " ".join(full.lower().split())
-
-    bdl_best_player = None
-    query_norm = " ".join(query_lower.split())
-
-    for p in players_data:
-        full_norm = _normalize_full_name(p)
-        if full_norm == query_norm:
-            bdl_best_player = p
-            break
-
-    if bdl_best_player is None and players_data:
-        bdl_best_player = players_data[0]
+    # 2) BallDontLie : meilleure correspondance en essayant nom complet + nom de famille. [web:101][web:139]
+    best_player, all_players = _search_bdl_best_player(query)
 
     bdl_injuries: List[Dict[str, Any]] = []
     bdl_player_info: Optional[Dict[str, Any]] = None
 
-    if bdl_best_player is not None:
-        pid = bdl_best_player.get("id")
-        team = bdl_best_player.get("team") or {}
-        full = _normalize_full_name(bdl_best_player)
+    if best_player is not None:
+        pid = best_player.get("id")
+        team = best_player.get("team") or {}
+        full = _normalize_full_name(best_player)
 
         bdl_player_info = {
             "id": pid,
             "full_name": full,
-            "first_name": bdl_best_player.get("first_name"),
-            "last_name": bdl_best_player.get("last_name"),
-            "position": bdl_best_player.get("position"),
+            "first_name": best_player.get("first_name"),
+            "last_name": best_player.get("last_name"),
+            "position": best_player.get("position"),
             "team": {
                 "id": team.get("id"),
                 "name": team.get("full_name") or team.get("name"),
@@ -462,7 +505,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
         "sources": {
             "balldontlie": {
                 "matched_player": bdl_player_info,
-                "raw_search_count": len(players_data),
+                "raw_search_count": len(all_players),
                 "injuries": bdl_injuries,
             },
             "espn": {
