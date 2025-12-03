@@ -4,10 +4,8 @@ from fastapi.responses import HTMLResponse
 from typing import Optional, Dict, Any, List, Tuple
 import os
 import json
-import time
 import requests
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright  # pour NBC
+from bs4 import BeautifulSoup  # ESPN / CBS / NBC
 
 app = FastAPI()
 
@@ -19,8 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ---------- Endpoints de base ----------
+# ============================================================
+#                     ENDPOINTS DE BASE
+# ============================================================
 
 @app.get("/health")
 def health_check():
@@ -32,8 +31,7 @@ def root():
     return {"message": "NBA injuries API is running"}
 
 
-# ---------- Endpoint de test multi-sources (factice) ----------
-
+# Endpoint de test factice
 @app.get("/injuries/test")
 def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
     player_name = player or "LeBron James"
@@ -60,7 +58,7 @@ def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
                 "injury": "ankle",
                 "details": "Likely to miss multiple games",
                 "last_update": "2025-12-01T18:40:00Z",
-                "url": "https://www.nbcsports.com/nba/nba/injuries",
+                "url": "https://www.nbcsports.com/nba/nba-injuries-nbc-sports",
             },
             "balldontlie": {
                 "status": "out",
@@ -251,9 +249,7 @@ def injuries_balldontlie_by_player_id(
     player_id: int,
     per_page: int = 50,
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {
-        "per_page": per_page,
-    }
+    params: Dict[str, Any] = {"per_page": per_page}
 
     raw = _call_balldontlie("/v1/player_injuries", params=params)
     raw_data: List[Dict[str, Any]] = raw.get("data", [])
@@ -278,7 +274,7 @@ def injuries_balldontlie_by_player_id(
 
 
 # ============================================================
-#               CACHE DES JOUEURS ACTIFS (AUTO-COMPLETE)
+#       CACHE JOUEURS ACTIFS (AUTOCOMPLÉTION FRONT)
 # ============================================================
 
 ACTIVE_PLAYERS: List[Dict[str, Any]] = []
@@ -348,7 +344,7 @@ def players_active_local() -> Dict[str, Any]:
 #                            ESPN
 # ============================================================
 
-ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"
+ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"  # [web:20]
 
 
 def _fetch_espn_html() -> str:
@@ -372,7 +368,6 @@ def _fetch_espn_html() -> str:
 
 def _parse_espn_injuries(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
-
     results: List[Dict[str, Any]] = []
 
     tables = soup.find_all("table")
@@ -381,8 +376,8 @@ def _parse_espn_injuries(html: str) -> List[Dict[str, Any]]:
         if not headers:
             continue
 
-        wanted_headers = ["NAME", "POS", "EST. RETURN DATE", "STATUS", "COMMENT"]
-        if not all(h in headers for h in wanted_headers):
+        wanted = ["NAME", "POS", "EST. RETURN DATE", "STATUS", "COMMENT"]
+        if not all(h in headers for h in wanted):
             continue
 
         idx_name = headers.index("NAME")
@@ -434,7 +429,6 @@ def espn_raw() -> Dict[str, Any]:
 def injuries_espn() -> Dict[str, Any]:
     html = _fetch_espn_html()
     parsed = _parse_espn_injuries(html)
-
     return {
         "source": "espn",
         "count": len(parsed),
@@ -443,35 +437,14 @@ def injuries_espn() -> Dict[str, Any]:
 
 
 # ============================================================
-#                            NBC (Playwright)
+#                            NBC
 # ============================================================
 
-NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba/injuries"  # page dynamique [web:18]
-
-NBC_CACHE: Dict[str, Any] = {"data": None, "timestamp": 0.0}
-NBC_CACHE_TTL_SECONDS = 300  # 5 minutes
+# Page injuries NBC actuelle (route "Injuries" dans le menu NBA). [web:156]
+NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba-injuries-nbc-sports"
 
 
-def _fetch_nbc_text() -> str:
-    """
-    Utilise Playwright pour charger la page NBC (JS exécuté) puis récupère innerText du body.
-    Fallback sur requests si Playwright échoue ou n'est pas dispo.
-    """
-    use_playwright = os.getenv("NBC_USE_PLAYWRIGHT", "true").lower() == "true"
-    if use_playwright:
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(NBC_INJURIES_URL, wait_until="networkidle", timeout=30000)
-                text = page.inner_text("body")
-                browser.close()
-                return text
-        except Exception as e:
-            # En cas d'échec, on log et on retombe sur requests
-            print(f"[NBC] Playwright failed: {e}")
-
-    # Fallback: HTML brut (souvent sans données complètes, mais mieux que rien)
+def _fetch_nbc_html() -> str:
     try:
         resp = requests.get(
             NBC_INJURIES_URL,
@@ -487,52 +460,60 @@ def _fetch_nbc_text() -> str:
             detail=f"NBC error: {resp.text[:200]}",
         )
 
-    # On prend le texte, même si incomplet
-    soup = BeautifulSoup(resp.text, "html.parser")
-    return soup.get_text("\n", strip=True)
+    return resp.text
 
 
-def _parse_nbc_injuries_from_text(text: str) -> List[Dict[str, Any]]:
+def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
     """
     Parse la page injuries NBC en texte brut.
-    Schéma dans le contenu rendu :
-    INJURIES -> All teams -> <TEAM> -> PLAYER / POS / DATE / INJURY + ligne de description, répété. [web:18]
+    Structure globale : menu, listes d'équipes, puis section "Injuries" avec
+    pour chaque équipe un bloc : TEAM, puis headers PLAYER/POS/DATE/INJURY
+    puis des blocs (name, pos, date, injury, description). [web:156]
     """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
     lines = [l for l in text.split("\n") if l.strip()]
+
     results: List[Dict[str, Any]] = []
 
     try:
-        start_idx = lines.index("INJURIES")
+        start_idx = lines.index("Injuries")
     except ValueError:
-        # Si on ne trouve pas le bloc injuries, on renvoie vide
-        return results
+        try:
+            start_idx = lines.index("INJURIES")
+        except ValueError:
+            return results
 
-    header_tokens = {"PLAYER", "POS", "DATE", "INJURY"}
+    header_tokens = {"PLAYER", "Pos", "POS", "Date", "DATE", "Injury", "INJURY"}
     positions = {
         "PG", "SG", "SF", "PF", "C",
         "G", "F",
-        "G-F", "F-G", "G/F", "F/C", "C/F"
+        "G-F", "F-G", "G/F", "F/C", "C/F",
     }
 
     i = start_idx
     current_team: Optional[str] = None
 
-    def looks_like_header(idx: int) -> bool:
+    def looks_like_team_header(idx: int) -> bool:
         if idx + 4 >= len(lines):
             return False
+        l0 = lines[idx].strip()
+        l1 = lines[idx + 1].strip()
+        l2 = lines[idx + 2].strip()
+        l3 = lines[idx + 3].strip()
+        l4 = lines[idx + 4].strip()
         return (
-            lines[idx] not in header_tokens
-            and lines[idx + 1] == "PLAYER"
-            and lines[idx + 2] == "POS"
-            and lines[idx + 3] == "DATE"
-            and lines[idx + 4] == "INJURY"
+            l0 not in header_tokens
+            and l1 in {"PLAYER", "Player"}
+            and l2 in {"POS", "Pos"}
+            and l3 in {"DATE", "Date"}
+            and l4 in {"INJURY", "Injury"}
         )
 
     while i < len(lines) - 5:
-        # Détection d'un nouveau bloc équipe
-        if looks_like_header(i):
+        if looks_like_team_header(i):
             current_team = lines[i].strip()
-            i += 5  # TEAM + PLAYER POS DATE INJURY
+            i += 5
             continue
 
         if current_team is None:
@@ -548,7 +529,6 @@ def _parse_nbc_injuries_from_text(text: str) -> List[Dict[str, Any]]:
         injury = lines[i + 3].strip()
         desc = lines[i + 4].strip()
 
-        # Évite de confondre avec les headers
         if (
             name in header_tokens
             or pos in header_tokens
@@ -558,7 +538,6 @@ def _parse_nbc_injuries_from_text(text: str) -> List[Dict[str, Any]]:
             i += 1
             continue
 
-        # Filtre sur position pour éviter des faux positifs
         if pos not in positions:
             i += 1
             continue
@@ -579,21 +558,11 @@ def _parse_nbc_injuries_from_text(text: str) -> List[Dict[str, Any]]:
     return results
 
 
-def _get_nbc_injuries_cached() -> List[Dict[str, Any]]:
-    now = time.time()
-    if NBC_CACHE["data"] is not None and now - NBC_CACHE["timestamp"] < NBC_CACHE_TTL_SECONDS:
-        return NBC_CACHE["data"]
-
-    text = _fetch_nbc_text()
-    parsed = _parse_nbc_injuries_from_text(text)
-    NBC_CACHE["data"] = parsed
-    NBC_CACHE["timestamp"] = now
-    return parsed
-
-
 @app.get("/nbc/raw")
 def nbc_raw() -> Dict[str, Any]:
-    text = _fetch_nbc_text()
+    html = _fetch_nbc_html()
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
     return {
         "source": "nbc",
         "url": NBC_INJURIES_URL,
@@ -604,7 +573,8 @@ def nbc_raw() -> Dict[str, Any]:
 
 @app.get("/injuries/nbc")
 def injuries_nbc() -> Dict[str, Any]:
-    parsed = _get_nbc_injuries_cached()
+    html = _fetch_nbc_html()
+    parsed = _parse_nbc_injuries(html)
     return {
         "source": "nbc",
         "count": len(parsed),
@@ -616,7 +586,7 @@ def injuries_nbc() -> Dict[str, Any]:
 #                            CBS
 # ============================================================
 
-CBS_INJURIES_URL = "https://www.cbssports.com/nba/injuries/"
+CBS_INJURIES_URL = "https://www.cbssports.com/nba/injuries/"  # [web:6]
 
 
 def _fetch_cbs_html() -> str:
@@ -664,8 +634,8 @@ def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
         if not headers:
             continue
 
-        wanted_headers = ["Player", "Position", "Updated", "Injury", "Injury Status"]
-        if not all(h in headers for h in wanted_headers):
+        wanted = ["Player", "Position", "Updated", "Injury", "Injury Status"]
+        if not all(h in headers for h in wanted):
             continue
 
         idx_name = headers.index("Player")
@@ -718,7 +688,6 @@ def cbs_raw():
 def injuries_cbs():
     html = _fetch_cbs_html()
     parsed = _parse_cbs_injuries(html)
-
     return {
         "source": "cbs",
         "count": len(parsed),
@@ -727,7 +696,7 @@ def injuries_cbs():
 
 
 # ============================================================
-#           HELPER: meilleure correspondance joueur BDL
+#           HELPER: meilleure correspondance BDL
 # ============================================================
 
 def _normalize_full_name(p: Dict[str, Any]) -> str:
@@ -783,7 +752,7 @@ def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[D
 
 
 # ============================================================
-#                  ENDPOINT MULTI-SOURCES PAR JOUEUR
+#            ENDPOINT MULTI-SOURCES PAR JOUEUR
 # ============================================================
 
 def _compute_aggregated_status(
@@ -812,10 +781,6 @@ def _compute_aggregated_status(
 
 @app.get("/injuries/by-player")
 def injuries_by_player(name: str) -> Dict[str, Any]:
-    """
-    Agrège les infos par joueur :
-    - BallDontLie, ESPN, NBC, CBS.
-    """
     query = name.strip()
     if not query:
         raise HTTPException(status_code=400, detail="name parameter must not be empty")
@@ -826,26 +791,21 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
     espn_html = _fetch_espn_html()
     espn_all = _parse_espn_injuries(espn_html)
     espn_matches = [
-        item
-        for item in espn_all
-        if query_lower in item["player_name"].lower()
+        item for item in espn_all if query_lower in item["player_name"].lower()
     ]
 
     # NBC
-    nbc_all = _get_nbc_injuries_cached()
+    nbc_html = _fetch_nbc_html()
+    nbc_all = _parse_nbc_injuries(nbc_html)
     nbc_matches = [
-        item
-        for item in nbc_all
-        if query_lower in item["player_name"].lower()
+        item for item in nbc_all if query_lower in item["player_name"].lower()
     ]
 
     # CBS
     cbs_html = _fetch_cbs_html()
     cbs_all = _parse_cbs_injuries(cbs_html)
     cbs_matches = [
-        item
-        for item in cbs_all
-        if query_lower in item["player_name"].lower()
+        item for item in cbs_all if query_lower in item["player_name"].lower()
     ]
 
     # BallDontLie
@@ -939,17 +899,14 @@ def widget() -> str:
         "Segoe UI", sans-serif;
     }}
     * {{ box-sizing: border-box; }}
-
     #injury-app {{
       color: #e5e7eb;
     }}
-
     .ia-shell {{
       max-width: 1040px;
       margin: 0 auto;
       padding: 28px 12px 40px;
     }}
-
     .ia-card {{
       position: relative;
       padding: 24px 20px 26px;
@@ -961,18 +918,6 @@ def widget() -> str:
         0 0 0 1px rgba(15, 23, 42, 0.65);
       overflow: hidden;
     }}
-
-    .ia-card::before {{
-      content: "";
-      position: absolute;
-      inset: 0;
-      opacity: 0.4;
-      background:
-        radial-gradient(circle at 0 0, rgba(59, 130, 246, 0.32) 0, transparent 55%),
-        radial-gradient(circle at 100% 0, rgba(147, 51, 234, 0.28) 0, transparent 50%);
-      pointer-events: none;
-    }}
-
     .ia-title {{
       position: relative;
       margin: 0 0 6px;
@@ -983,7 +928,6 @@ def widget() -> str:
       color: #f9fafb;
       text-align: center;
     }}
-
     .ia-subtitle {{
       position: relative;
       margin: 0 0 18px;
@@ -991,14 +935,12 @@ def widget() -> str:
       color: #9ca3af;
       text-align: center;
     }}
-
     .ia-wake-row {{
       display: flex;
       align-items: center;
       gap: 10px;
       margin-bottom: 10px;
     }}
-
     #ia-wake-btn {{
       padding: 7px 12px;
       border-radius: 8px;
@@ -1009,29 +951,24 @@ def widget() -> str:
       cursor: pointer;
       white-space: nowrap;
     }}
-
     #ia-wake-btn:hover:not(:disabled) {{
       background: rgba(30, 64, 175, 0.8);
       border-color: rgba(96, 165, 250, 0.8);
     }}
-
     #ia-wake-btn:disabled {{
       opacity: 0.6;
       cursor: default;
     }}
-
     .ia-wake-status {{
       font-size: 11px;
       color: #9ca3af;
     }}
-
     .ia-search-row {{
       display: flex;
       align-items: center;
       gap: 8px;
       margin-bottom: 10px;
     }}
-
     .ia-search {{
       position: relative;
       flex: 1;
@@ -1039,12 +976,10 @@ def widget() -> str:
       gap: 10px;
       z-index: 2;
     }}
-
     .ia-search-input-wrap {{
       position: relative;
       flex: 1;
     }}
-
     #ia-player-input {{
       width: 100%;
       padding: 11px 12px;
@@ -1055,16 +990,13 @@ def widget() -> str:
       font-size: 14px;
       outline: none;
     }}
-
     #ia-player-input::placeholder {{
       color: #6b7280;
     }}
-
     #ia-player-input:focus {{
       border-color: #60a5fa;
       box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.7);
     }}
-
     #ia-search-btn {{
       padding: 11px 16px;
       border-radius: 10px;
@@ -1077,17 +1009,14 @@ def widget() -> str:
       white-space: nowrap;
       box-shadow: 0 12px 25px rgba(37, 99, 235, 0.45);
     }}
-
     #ia-search-btn:disabled {{
       opacity: 0.6;
       cursor: default;
       box-shadow: none;
     }}
-
     #ia-search-btn:hover:not(:disabled) {{
       background: linear-gradient(to right, #1d4ed8, #4338ca);
     }}
-
     #ia-reset-btn {{
       padding: 9px 12px;
       border-radius: 10px;
@@ -1098,18 +1027,15 @@ def widget() -> str:
       cursor: pointer;
       white-space: nowrap;
     }}
-
     #ia-reset-btn:hover:not(:disabled) {{
       background: rgba(30, 64, 175, 0.7);
       border-color: rgba(96, 165, 250, 0.9);
     }}
-
     .ia-hint {{
       margin: 4px 0 8px;
       font-size: 11px;
       color: #9ca3af;
     }}
-
     .ia-suggestions {{
       position: absolute;
       left: 0;
@@ -1123,7 +1049,6 @@ def widget() -> str:
       box-shadow: 0 18px 40px rgba(0, 0, 0, 0.9);
       z-index: 50;
     }}
-
     .ia-suggestion-item {{
       padding: 7px 10px;
       font-size: 13px;
@@ -1132,31 +1057,25 @@ def widget() -> str:
       justify-content: space-between;
       gap: 8px;
     }}
-
     .ia-suggestion-item:nth-child(2n) {{
       background: rgba(15, 23, 42, 0.9);
     }}
-
     .ia-suggestion-item:hover {{
       background: rgba(37, 99, 235, 0.25);
     }}
-
     .ia-suggestion-name {{
       font-weight: 500;
     }}
-
     .ia-suggestion-meta {{
       color: #9ca3af;
       font-size: 12px;
     }}
-
     .ia-loader {{
       position: relative;
       margin: 6px 0 4px;
       font-size: 13px;
       color: #e5e7eb;
     }}
-
     .ia-error {{
       position: relative;
       margin: 8px 0 6px;
@@ -1167,7 +1086,6 @@ def widget() -> str:
       color: #fecaca;
       font-size: 13px;
     }}
-
     .ia-player-card {{
       position: relative;
       display: flex;
@@ -1178,7 +1096,6 @@ def widget() -> str:
       background: rgba(15, 23, 42, 0.96);
       border: 1px solid rgba(148, 163, 184, 0.65);
     }}
-
     .ia-player-avatar-wrap {{
       flex: 0 0 72px;
       height: 72px;
@@ -1190,33 +1107,28 @@ def widget() -> str:
       align-items: center;
       justify-content: center;
     }}
-
     .ia-player-avatar-initials {{
       font-size: 22px;
       font-weight: 600;
       color: #e5f4ff;
     }}
-
     .ia-player-info {{
       flex: 1;
       display: flex;
       flex-direction: column;
       justify-content: center;
     }}
-
     .ia-player-name-row {{
       display: flex;
       align-items: center;
       gap: 8px;
       margin-bottom: 4px;
     }}
-
     .ia-player-name {{
       font-size: 17px;
       font-weight: 600;
       color: #f9fafb;
     }}
-
     .ia-agg-badge {{
       font-size: 11px;
       padding: 3px 8px;
@@ -1227,32 +1139,27 @@ def widget() -> str:
       text-transform: uppercase;
       letter-spacing: 0.08em;
     }}
-
     .ia-agg-clear {{
       background: rgba(22, 163, 74, 0.18);
       color: #bbf7d0;
       border: 1px solid rgba(22, 163, 74, 0.6);
     }}
-
     .ia-agg-flagged {{
       background: rgba(220, 38, 38, 0.18);
       color: #fecaca;
       border: 1px solid rgba(220, 38, 38, 0.6);
     }}
-
     .ia-agg-dot {{
       width: 7px;
       height: 7px;
       border-radius: 999px;
       background: currentColor;
     }}
-
     .ia-player-meta-row {{
       display: flex;
       align-items: center;
       gap: 6px;
     }}
-
     .ia-team-logo {{
       width: 20px;
       height: 20px;
@@ -1260,39 +1167,32 @@ def widget() -> str:
       object-fit: contain;
       background: #020617;
     }}
-
     .ia-player-meta {{
       font-size: 13px;
       color: #cbd5f5;
     }}
-
     .ia-grid {{
       position: relative;
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 12px;
     }}
-
     @media (max-width: 900px) {{
       .ia-grid {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
     }}
-
     @media (max-width: 600px) {{
       .ia-grid {{
         grid-template-columns: minmax(0, 1fr);
       }}
-
       .ia-card {{
         padding: 20px 16px 24px;
       }}
-
       .ia-player-card {{
         flex-direction: row;
       }}
     }}
-
     .ia-col {{
       background: rgba(15, 23, 42, 0.97);
       border-radius: 12px;
@@ -1302,29 +1202,24 @@ def widget() -> str:
       flex-direction: column;
       overflow: hidden;
     }}
-
     .ia-col-header {{
       padding: 6px 9px;
       border-bottom: 1px solid rgba(148, 163, 184, 0.5);
       background: linear-gradient(to right, rgba(30, 64, 175, 0.65), rgba(15, 23, 42, 0.95));
     }}
-
     .ia-col-label {{
       font-size: 11px;
       text-transform: uppercase;
       letter-spacing: 0.14em;
       color: #e5e7eb;
     }}
-
     .ia-col-body {{
       padding: 8px 9px 10px;
     }}
-
     .ia-col-body p {{
       margin: 0 0 4px;
       font-size: 13px;
     }}
-
     .ia-badge-empty {{
       display: inline-block;
       padding: 4px 8px;
@@ -1333,16 +1228,13 @@ def widget() -> str:
       font-size: 11px;
       color: #9ca3af;
     }}
-
     .ia-status {{
       font-weight: 500;
     }}
-
     .ia-meta {{
       font-size: 12px;
       color: #9ca3af;
     }}
-
     .ia-footer {{
       position: relative;
       margin: 16px 0 0;
@@ -1443,7 +1335,7 @@ def widget() -> str:
         </div>
 
         <p class="ia-footer">
-          Données live&nbsp;: BallDontLie, ESPN, CBS, NBC.
+          Données live : BallDontLie, ESPN, CBS, NBC.
         </p>
       </div>
     </div>
