@@ -104,20 +104,18 @@ def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[st
 def _map_balldontlie_injury(item: Dict[str, Any]) -> Dict[str, Any]:
     """
     Transforme un enregistrement brut de BallDontLie en format simplifié.
-    On part de ce qu’on voit réellement dans ta réponse :
-    - player_id
-    - status
-    - description
-    - return_date
-    etc. [web:101]
+    Selon la spec OpenAPI, chaque injury contient un objet `player`. [web:43][web:101]
     """
+    player = item.get("player") or {}
+    team_id = player.get("team_id")  # id d'équipe dans l'objet joueur. [web:43]
+
     return {
-        "player_id": item.get("player_id"),
-        "player_name": None,            # sera rempli plus tard via un autre endpoint /players [web:101][web:28]
-        "team_id": None,                # idem
-        "team_name": None,              # idem
-        "status": item.get("status"),   # ex: "Out", "Day-To-Day" [web:101]
-        "injury": item.get("injury"),   # peut être null [web:101]
+        "player_id": player.get("id"),
+        "player_name": player.get("full_name"),
+        "team_id": team_id,
+        "team_name": None,  # on remplira plus tard via un autre endpoint /teams si besoin. [web:43][web:28]
+        "status": item.get("status"),        # ex: "Out", "Day-To-Day" [web:101]
+        "injury": item.get("injury"),        # peut être null [web:101]
         "description": item.get("description"),
         "return_date": item.get("return_date"),
         "last_update": item.get("updated_at") or item.get("created_at"),
