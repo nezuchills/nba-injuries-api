@@ -450,7 +450,7 @@ def injuries_espn() -> Dict[str, Any]:
 
 
 # ============================================================
-#                            NBC (placeholder)
+#                            NBC
 # ============================================================
 
 NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba-injuries-nbc-sports"
@@ -752,7 +752,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
     Agrège les infos par joueur sans les fusionner :
     - BallDontLie : joueur correspondant + blessures associées.
     - ESPN : lignes d'injuries dont le nom matche.
-    - NBC : lignes d'injuries.
+    - NBC : lignes d'injuries dont le nom matche.
     - CBS : lignes d'injuries dont le nom matche.
     + champ aggregated.status pour le ticker (clear / flagged).
     """
@@ -861,7 +861,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
 def widget() -> str:
     """
     Petite page HTML autonome (dark, auto-complétion rapide via cache,
-    tuiles + statut agrégé, bouton de réveil Render).
+    tuiles + statut agrégé, bouton de réveil Render + bouton de reset).
     Les joueurs actifs sont injectés directement dans la page pour éviter
     tout appel réseau pour l'auto-complétion.
     """
@@ -971,9 +971,16 @@ def widget() -> str:
       color: #9ca3af;
     }}
 
+    .ia-search-row {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }}
+
     .ia-search {{
       position: relative;
-      margin-bottom: 10px;
+      flex: 1;
       display: flex;
       gap: 10px;
       z-index: 2;
@@ -1025,6 +1032,22 @@ def widget() -> str:
 
     #ia-search-btn:hover:not(:disabled) {{
       background: linear-gradient(to right, #1d4ed8, #4338ca);
+    }}
+
+    #ia-reset-btn {{
+      padding: 9px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.7);
+      background: rgba(15, 23, 42, 0.96);
+      color: #e5e7eb;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+
+    #ia-reset-btn:hover:not(:disabled) {{
+      background: rgba(30, 64, 175, 0.7);
+      border-color: rgba(96, 165, 250, 0.9);
     }}
 
     .ia-hint {{
@@ -1309,17 +1332,20 @@ def widget() -> str:
           </div>
         </div>
 
-        <div class="ia-search">
-          <div class="ia-search-input-wrap">
-            <input
-              id="ia-player-input"
-              type="text"
-              placeholder="Rechercher un joueur (min. 3 caractères, ex : Kristaps Porzingis)"
-              autocomplete="off"
-            />
-            <div id="ia-suggestions" class="ia-suggestions" style="display:none;"></div>
+        <div class="ia-search-row">
+          <div class="ia-search">
+            <div class="ia-search-input-wrap">
+              <input
+                id="ia-player-input"
+                type="text"
+                placeholder="Rechercher un joueur (min. 3 caractères, ex : Kristaps Porzingis)"
+                autocomplete="off"
+              />
+              <div id="ia-suggestions" class="ia-suggestions" style="display:none;"></div>
+            </div>
+            <button id="ia-search-btn">Chercher</button>
           </div>
-          <button id="ia-search-btn">Chercher</button>
+          <button id="ia-reset-btn" type="button">Réinitialiser</button>
         </div>
 
         <div class="ia-hint">
@@ -1385,7 +1411,7 @@ def widget() -> str:
         </div>
 
         <p class="ia-footer">
-          Données live&nbsp;: BallDontLie, ESPN, CBS.
+          Données live&nbsp;: BallDontLie, ESPN, CBS, NBC.
         </p>
       </div>
     </div>
@@ -1401,7 +1427,8 @@ def widget() -> str:
       const wakeStatus = document.getElementById("ia-wake-status");
 
       const input = document.getElementById("ia-player-input");
-      const button = document.getElementById("ia-search-btn");
+      const searchBtn = document.getElementById("ia-search-btn");
+      const resetBtn = document.getElementById("ia-reset-btn");
       const loader = document.getElementById("ia-loader");
       const errorBox = document.getElementById("ia-error");
       const results = document.getElementById("ia-results");
@@ -1423,8 +1450,8 @@ def widget() -> str:
       async function wakeService() {{
         // Empêche plusieurs clics simultanés, mais permet de réutiliser le bouton plus tard
         wakeBtn.disabled = true;
-        const prevSearchDisabled = button.disabled;
-        button.disabled = true; // on bloque aussi la recherche pendant le réveil
+        const prevSearchDisabled = searchBtn.disabled;
+        searchBtn.disabled = true; // on bloque aussi la recherche pendant le réveil
         wakeStatus.textContent = "Réveil en cours… cela peut prendre jusqu'à une minute si le service dormait.";
 
         const controller = new AbortController();
@@ -1449,7 +1476,7 @@ def widget() -> str:
         }} finally {{
           // On réactive toujours les boutons pour pouvoir réutiliser le bouton de réveil plus tard
           wakeBtn.disabled = false;
-          button.disabled = prevSearchDisabled;
+          searchBtn.disabled = prevSearchDisabled;
 
           // Optionnel : au bout de 30s, on remet le message par défaut
           setTimeout(() => {{
@@ -1466,7 +1493,7 @@ def widget() -> str:
 
       function setLoading(isLoading) {{
         loader.style.display = isLoading ? "block" : "none";
-        button.disabled = isLoading;
+        searchBtn.disabled = isLoading;
       }}
 
       function setError(message) {{
@@ -1713,8 +1740,19 @@ def widget() -> str:
         }}
       }}
 
+      function resetSearch() {{
+        input.value = "";
+        closeSuggestions();
+        setError("");
+        results.style.display = "none";
+        playerCard.style.display = "none";
+        clearSources();
+        loader.style.display = "none";
+      }}
+
       wakeBtn.addEventListener("click", wakeService);
-      button.addEventListener("click", searchPlayer);
+      searchBtn.addEventListener("click", searchPlayer);
+      resetBtn.addEventListener("click", resetSearch);
 
       input.addEventListener("keydown", function (e) {{
         if (e.key === "Enter") {{
