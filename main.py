@@ -4,7 +4,19 @@ import os
 import requests
 from bs4 import BeautifulSoup  # parser HTML (ESPN, NBC, CBS)
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI()
+
+# CORS : autorise les appels depuis Carrd (tous domaines pour l'instant).
+# Tu pourras remplacer "*" par ["https://tonsite.carrd.co"] plus tard.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------- Endpoints de base ----------
@@ -510,7 +522,7 @@ def _clean_cbs_player_name(raw: str) -> str:
     """
     CBS concatène abréviation + nom complet : ex. 'K. PorzingisKristaps Porzingis'.
     On cherche la première transition 'minuscule' -> 'majuscule' sans espace
-    et on garde la partie droite comme nom complet. [web:6][file:1]
+    et on garde la partie droite comme nom complet.
     """
     s = raw.strip()
     split_idx = None
@@ -530,7 +542,7 @@ def _clean_cbs_player_name(raw: str) -> str:
 def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
     """
     Parse les tableaux CBS (Player / Position / Updated / Injury / Injury Status),
-    en nettoyant player_name pour ne garder que le nom complet. [web:6][file:1]
+    en nettoyant player_name pour ne garder que le nom complet.
     """
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
