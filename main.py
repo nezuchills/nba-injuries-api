@@ -6,6 +6,8 @@ import requests
 app = FastAPI()
 
 
+# ---------- Endpoints de base ----------
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
@@ -15,6 +17,8 @@ def health_check():
 def root():
     return {"message": "NBA injuries API is running"}
 
+
+# ---------- Endpoint de test multi-sources (factice) ----------
 
 @app.get("/injuries/test")
 def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
@@ -62,27 +66,33 @@ def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
     return example_response
 
 
-@app.get("/balldontlie/raw")
-def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[str, Any]:
-    """
-    Renvoie les données brutes de BallDontLie pour les blessures (JSON complet).
-    - Paginate avec cursor / per_page. [web:101]
-    """
+# ---------- Helpers BallDontLie ----------
+
+def _get_balldontlie_api_key() -> str:
     api_key = os.getenv("BALLDONTLIE_API_KEY")
     if not api_key:
         raise HTTPException(
             status_code=500,
             detail="BALLDONTLIE_API_KEY is not set on the server",
         )
+    return api_key
 
-    url = "https://api.balldontlie.io/v1/player_injuries"
+
+def _call_balldontlie(
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 10,
+) -> Dict[str, Any]:
+    """
+    Appelle un endpoint BallDontLie donné (path = '/v1/xxx') et renvoie le JSON. [web:101]
+    """
+    api_key = _get_balldontlie_api_key()
+    base_url = "https://api.balldontlie.io"
+    url = f"{base_url}{path}"
     headers = {"Authorization": api_key}
-    params: Dict[str, Any] = {"per_page": per_page}
-    if cursor is not None:
-        params["cursor"] = cursor
 
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        resp = requests.get(url, headers=headers, params=params or {}, timeout=timeout)
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Error calling BallDontLie: {e}")
 
@@ -92,10 +102,24 @@ def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[st
             detail=f"BallDontLie error: {resp.text[:200]}",
         )
 
-    data = resp.json()
+    return resp.json()
+
+
+# ---------- BallDontLie : raw injuries ----------
+
+@app.get("/balldontlie/raw")
+def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[str, Any]:
+    """
+    Renvoie les données brutes de BallDontLie pour les blessures (JSON complet). [web:101]
+    """
+    params: Dict[str, Any] = {"per_page": per_page}
+    if cursor is not None:
+        params["cursor"] = cursor
+
+    data = _call_balldontlie("/v1/player_injuries", params=params)
     return {
         "source": "balldontlie",
-        "endpoint": url,
+        "endpoint": "https://api.balldontlie.io/v1/player_injuries",
         "params": params,
         "data": data,
     }
@@ -103,19 +127,18 @@ def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[st
 
 def _map_balldontlie_injury(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Transforme un enregistrement brut de BallDontLie en format simplifié.
-    Selon la spec OpenAPI, chaque injury contient un objet `player`. [web:43][web:101]
+    Transforme un enregistrement brut de BallDontLie en format simplifié. [web:43][web:101]
     """
     player = item.get("player") or {}
-    team_id = player.get("team_id")  # id d'équipe dans l'objet joueur. [web:43]
+    team_id = player.get("team_id")
 
     return {
         "player_id": player.get("id"),
-        "player_name": player.get("full_name"),
+        "player_name": player.get("full_name"),   # peut être null selon le schéma réel [web:43]
         "team_id": team_id,
-        "team_name": None,  # on remplira plus tard via un autre endpoint /teams si besoin. [web:43][web:28]
-        "status": item.get("status"),        # ex: "Out", "Day-To-Day" [web:101]
-        "injury": item.get("injury"),        # peut être null [web:101]
+        "team_name": None,                        # à remplir plus tard via /teams si besoin [web:43]
+        "status": item.get("status"),
+        "injury": item.get("injury"),
         "description": item.get("description"),
         "return_date": item.get("return_date"),
         "last_update": item.get("updated_at") or item.get("created_at"),
@@ -131,31 +154,11 @@ def injuries_balldontlie(
     """
     Renvoie les blessures BallDontLie dans un format simplifié pour le dashboard. [web:101]
     """
-    api_key = os.getenv("BALLDONTLIE_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="BALLDONTLIE_API_KEY is not set on the server",
-        )
-
-    url = "https://api.balldontlie.io/v1/player_injuries"
-    headers = {"Authorization": api_key}
     params: Dict[str, Any] = {"per_page": per_page}
     if cursor is not None:
         params["cursor"] = cursor
 
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error calling BallDontLie: {e}")
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"BallDontLie error: {resp.text[:200]}",
-        )
-
-    raw = resp.json()
+    raw = _call_balldontlie("/v1/player_injuries", params=params)
     raw_data: List[Dict[str, Any]] = raw.get("data", [])
     meta = raw.get("meta", {})
 
@@ -163,6 +166,65 @@ def injuries_balldontlie(
 
     return {
         "source": "balldontlie",
+        "count": len(simplified),
+        "meta": meta,
+        "injuries": simplified,
+    }
+
+
+# ---------- BallDontLie : infos joueur par ID ----------
+
+@app.get("/balldontlie/player/{player_id}")
+def balldontlie_player(player_id: int) -> Dict[str, Any]:
+    """
+    Renvoie les infos d’un joueur (nom, équipe, etc.) à partir de son ID BallDontLie. [web:101]
+    """
+    data = _call_balldontlie(f"/v1/players/{player_id}")
+    # Schéma typique /v1/players : id, full_name, first_name, last_name, team, etc. [web:101][web:28]
+    player_team = data.get("team") or {}
+
+    return {
+        "id": data.get("id"),
+        "full_name": data.get("full_name") or f"{data.get('first_name', '')} {data.get('last_name', '')}".strip(),
+        "first_name": data.get("first_name"),
+        "last_name": data.get("last_name"),
+        "position": data.get("position"),
+        "team": {
+            "id": player_team.get("id"),
+            "name": player_team.get("full_name") or player_team.get("name"),
+            "abbreviation": player_team.get("abbreviation"),
+            "city": player_team.get("city"),
+        },
+        "raw": data,
+    }
+
+
+# ---------- BallDontLie : blessures filtrées par player_id ----------
+
+@app.get("/injuries/balldontlie/by-player-id")
+def injuries_balldontlie_by_player_id(
+    player_id: int,
+    per_page: int = 50,
+) -> Dict[str, Any]:
+    """
+    Renvoie les blessures BallDontLie pour un joueur spécifique (par player_id). [web:101]
+    On filtre côté API sur l’ID du joueur.
+    """
+    # Selon la doc, on peut souvent filtrer par paramètres (exemple générique) [web:101][web:28].
+    params: Dict[str, Any] = {
+        "per_page": per_page,
+        "player_id": player_id,
+    }
+
+    raw = _call_balldontlie("/v1/player_injuries", params=params)
+    raw_data: List[Dict[str, Any]] = raw.get("data", [])
+    meta = raw.get("meta", {})
+
+    simplified = [_map_balldontlie_injury(item) for item in raw_data]
+
+    return {
+        "source": "balldontlie",
+        "player_id": player_id,
         "count": len(simplified),
         "meta": meta,
         "injuries": simplified,
