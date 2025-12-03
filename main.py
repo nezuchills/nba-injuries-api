@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from typing import Optional, Dict, Any, List
 import os
 import requests
+from bs4 import BeautifulSoup  # pour parser l'HTML ESPN [web:131][web:134]
 
 app = FastAPI()
 
@@ -157,13 +158,12 @@ def injuries_balldontlie(
     }
 
 
-# ---------- BallDontLie : infos joueur par ID (corrigé) ----------
+# ---------- BallDontLie : infos joueur par ID ----------
 
 @app.get("/balldontlie/player/{player_id}")
 def balldontlie_player(player_id: int) -> Dict[str, Any]:
     """
-    BallDontLie renvoie un wrapper {"data": {...}} pour /v1/players/{id}. [web:101][file:1]
-    On doit donc lire resp["data"] avant de sortir les champs.
+    Wrapper {"data": {...}} pour /v1/players/{id}. [web:101]
     """
     resp = _call_balldontlie(f"/v1/players/{player_id}")
     data = resp.get("data") or {}
@@ -216,4 +216,35 @@ def injuries_balldontlie_by_player_id(
         "count": len(simplified),
         "meta": meta,
         "injuries": simplified,
+    }
+
+
+# ---------- ESPN : récupération brute de la page ----------
+
+ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"  # page principale des blessures. [web:20]
+
+
+@app.get("/espn/raw")
+def espn_raw() -> Dict[str, Any]:
+    """
+    Récupère l'HTML brut de la page ESPN injuries.
+    Étape 1 : juste pour vérifier qu'on atteint bien la page depuis Render. [web:20]
+    """
+    try:
+        resp = requests.get(ESPN_INJURIES_URL, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Error calling ESPN: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"ESPN error: {resp.text[:200]}",
+        )
+
+    # On ne renvoie pas tout l'HTML (trop gros), juste quelques infos de debug.
+    return {
+        "source": "espn",
+        "url": ESPN_INJURIES_URL,
+        "status_code": resp.status_code,
+        "content_snippet": resp.text[:500],
     }
