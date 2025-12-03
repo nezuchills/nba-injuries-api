@@ -128,7 +128,6 @@ def _map_balldontlie_injury(item: Dict[str, Any]) -> Dict[str, Any]:
     player = item.get("player") or {}
     team = player.get("team") or {}
 
-    # Construire un full_name si absent
     full_name = player.get("full_name")
     if not full_name:
         first = player.get("first_name") or ""
@@ -210,23 +209,15 @@ def balldontlie_player(player_id: int) -> Dict[str, Any]:
 
 # ---- Recherche joueurs par nom (BallDontLie) ----
 
-def _search_balldontlie_players(query: str, per_page: int = 25) -> Dict[str, Any]:
-    """
-    Utilise /v1/players?search= pour trouver des joueurs par nom. [web:101][web:139]
-    """
-    params = {"search": query, "per_page": per_page}
-    resp = _call_balldontlie("/v1/players", params=params)
-    return resp
-
-
 @app.get("/players/balldontlie/search")
 def players_balldontlie_search(query: str, per_page: int = 25) -> Dict[str, Any]:
     """
-    Endpoint exposant la recherche joueurs BallDontLie (utile pour debug / frontend). [web:101][web:139]
+    Expose /v1/players?search= pour debug / frontend. [web:101][web:139]
     """
-    raw = _search_balldontlie_players(query=query, per_page=per_page)
-    data = raw.get("data", [])
-    meta = raw.get("meta", {})
+    params = {"search": query, "per_page": per_page}
+    resp = _call_balldontlie("/v1/players", params=params)
+    data = resp.get("data", [])
+    meta = resp.get("meta", {})
 
     players: List[Dict[str, Any]] = []
     for p in data:
@@ -398,7 +389,7 @@ def injuries_espn() -> Dict[str, Any]:
 def injuries_by_player(name: str) -> Dict[str, Any]:
     """
     Agrège les infos par joueur sans les fusionner :
-    - BallDontLie : joueur(s) correspondant + blessures associées.
+    - BallDontLie : joueur correspondant + blessures associées.
     - ESPN : lignes d'injuries dont le nom matche. [web:20][web:101]
     """
     query = name.strip()
@@ -416,13 +407,10 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
         if query_lower in item["player_name"].lower()
     ]
 
-    # 2) BallDontLie : recherche joueur, puis blessures
-    players_resp = _search_balldontlie_players(query=query, per_page=10)
+    # 2) BallDontLie : on refait la même requête que /players/balldontlie/search [web:101][web:139]
+    params = {"search": query, "per_page": 10}
+    players_resp = _call_balldontlie("/v1/players", params=params)
     players_data = players_resp.get("data", [])
-
-    # Trouver le meilleur match : d'abord égalité exacte sur le full_name, sinon premier qui contient le nom.
-    bdl_best_player = None
-    query_norm = " ".join(query_lower.split())
 
     def _normalize_full_name(p: Dict[str, Any]) -> str:
         full = p.get("full_name")
@@ -431,6 +419,9 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
             last = (p.get("last_name") or "").strip()
             full = f"{first} {last}".strip()
         return " ".join(full.lower().split())
+
+    bdl_best_player = None
+    query_norm = " ".join(query_lower.split())
 
     for p in players_data:
         full_norm = _normalize_full_name(p)
@@ -446,10 +437,9 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
 
     if bdl_best_player is not None:
         pid = bdl_best_player.get("id")
-
-        # Infos joueur formatées
         team = bdl_best_player.get("team") or {}
         full = _normalize_full_name(bdl_best_player)
+
         bdl_player_info = {
             "id": pid,
             "full_name": full,
@@ -464,7 +454,6 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
             },
         }
 
-        # Blessures associées à ce player_id
         injuries_resp = injuries_balldontlie_by_player_id(player_id=pid, per_page=50)
         bdl_injuries = injuries_resp.get("injuries", [])
 
