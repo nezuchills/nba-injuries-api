@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from typing import Optional, Dict, Any, List, Tuple
 import os
+import json
 import requests
 from bs4 import BeautifulSoup  # parser HTML (ESPN, NBC, CBS)
 
@@ -340,6 +341,7 @@ def _load_active_players() -> None:
 def players_active_local() -> Dict[str, Any]:
     """
     Retourne la liste en cache des joueurs actifs (pour auto-complétion).
+    Toujours disponible pour d'autres clients, même si le widget injecte déjà cette liste.
     """
     _load_active_players()
     return {
@@ -858,10 +860,15 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
 @app.get("/widget", response_class=HTMLResponse)
 def widget() -> str:
     """
-    Petite page HTML autonome (dark, auto-complétion rapide via cache, tuiles)
-    qui consomme directement les endpoints de cette API. À embed dans Carrd via iframe.
+    Petite page HTML autonome (dark, auto-complétion rapide via cache,
+    tuiles + statut agrégé, bouton de réveil Render).
+    Les joueurs actifs sont injectés directement dans la page pour éviter
+    tout appel réseau pour l'auto-complétion.
     """
-    return """
+    _load_active_players()
+    players_json = json.dumps(ACTIVE_PLAYERS)
+
+    return f"""
 <!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -869,27 +876,27 @@ def widget() -> str:
   <title>NBA Injury Checker</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body {
+    body {{
       margin: 0;
       padding: 0;
       background: #020617;
       color: #e5e7eb;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
         "Segoe UI", sans-serif;
-    }
-    * { box-sizing: border-box; }
+    }}
+    * {{ box-sizing: border-box; }}
 
-    #injury-app {
+    #injury-app {{
       color: #e5e7eb;
-    }
+    }}
 
-    .ia-shell {
+    .ia-shell {{
       max-width: 1040px;
       margin: 0 auto;
       padding: 28px 12px 40px;
-    }
+    }}
 
-    .ia-card {
+    .ia-card {{
       position: relative;
       padding: 24px 20px 26px;
       border-radius: 20px;
@@ -899,9 +906,9 @@ def widget() -> str:
         0 32px 80px rgba(0, 0, 0, 0.75),
         0 0 0 1px rgba(15, 23, 42, 0.65);
       overflow: hidden;
-    }
+    }}
 
-    .ia-card::before {
+    .ia-card::before {{
       content: "";
       position: absolute;
       inset: 0;
@@ -910,9 +917,9 @@ def widget() -> str:
         radial-gradient(circle at 0 0, rgba(59, 130, 246, 0.32) 0, transparent 55%),
         radial-gradient(circle at 100% 0, rgba(147, 51, 234, 0.28) 0, transparent 50%);
       pointer-events: none;
-    }
+    }}
 
-    .ia-title {
+    .ia-title {{
       position: relative;
       margin: 0 0 6px;
       font-size: 26px;
@@ -921,24 +928,24 @@ def widget() -> str:
       text-transform: uppercase;
       color: #f9fafb;
       text-align: center;
-    }
+    }}
 
-    .ia-subtitle {
+    .ia-subtitle {{
       position: relative;
       margin: 0 0 18px;
       font-size: 13px;
       color: #9ca3af;
       text-align: center;
-    }
+    }}
 
-    .ia-wake-row {
+    .ia-wake-row {{
       display: flex;
       align-items: center;
       gap: 10px;
       margin-bottom: 10px;
-    }
+    }}
 
-    #ia-wake-btn {
+    #ia-wake-btn {{
       padding: 7px 12px;
       border-radius: 8px;
       border: 1px solid rgba(148, 163, 184, 0.7);
@@ -947,37 +954,37 @@ def widget() -> str:
       font-size: 12px;
       cursor: pointer;
       white-space: nowrap;
-    }
+    }}
 
-    #ia-wake-btn:hover:not(:disabled) {
+    #ia-wake-btn:hover:not(:disabled) {{
       background: rgba(30, 64, 175, 0.8);
       border-color: rgba(96, 165, 250, 0.8);
-    }
+    }}
 
-    #ia-wake-btn:disabled {
+    #ia-wake-btn:disabled {{
       opacity: 0.6;
       cursor: default;
-    }
+    }}
 
-    .ia-wake-status {
+    .ia-wake-status {{
       font-size: 11px;
       color: #9ca3af;
-    }
+    }}
 
-    .ia-search {
+    .ia-search {{
       position: relative;
       margin-bottom: 10px;
       display: flex;
       gap: 10px;
       z-index: 2;
-    }
+    }}
 
-    .ia-search-input-wrap {
+    .ia-search-input-wrap {{
       position: relative;
       flex: 1;
-    }
+    }}
 
-    #ia-player-input {
+    #ia-player-input {{
       width: 100%;
       padding: 11px 12px;
       border-radius: 10px;
@@ -986,18 +993,18 @@ def widget() -> str:
       color: #f9fafb;
       font-size: 14px;
       outline: none;
-    }
+    }}
 
-    #ia-player-input::placeholder {
+    #ia-player-input::placeholder {{
       color: #6b7280;
-    }
+    }}
 
-    #ia-player-input:focus {
+    #ia-player-input:focus {{
       border-color: #60a5fa;
       box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.7);
-    }
+    }}
 
-    #ia-search-btn {
+    #ia-search-btn {{
       padding: 11px 16px;
       border-radius: 10px;
       border: none;
@@ -1008,25 +1015,25 @@ def widget() -> str:
       cursor: pointer;
       white-space: nowrap;
       box-shadow: 0 12px 25px rgba(37, 99, 235, 0.45);
-    }
+    }}
 
-    #ia-search-btn:disabled {
+    #ia-search-btn:disabled {{
       opacity: 0.6;
       cursor: default;
       box-shadow: none;
-    }
+    }}
 
-    #ia-search-btn:hover:not(:disabled) {
+    #ia-search-btn:hover:not(:disabled) {{
       background: linear-gradient(to right, #1d4ed8, #4338ca);
-    }
+    }}
 
-    .ia-hint {
+    .ia-hint {{
       margin: 4px 0 8px;
       font-size: 11px;
       color: #9ca3af;
-    }
+    }}
 
-    .ia-suggestions {
+    .ia-suggestions {{
       position: absolute;
       left: 0;
       right: 0;
@@ -1038,42 +1045,42 @@ def widget() -> str:
       border: 1px solid rgba(148, 163, 184, 0.7);
       box-shadow: 0 18px 40px rgba(0, 0, 0, 0.9);
       z-index: 50;
-    }
+    }}
 
-    .ia-suggestion-item {
+    .ia-suggestion-item {{
       padding: 7px 10px;
       font-size: 13px;
       cursor: pointer;
       display: flex;
       justify-content: space-between;
       gap: 8px;
-    }
+    }}
 
-    .ia-suggestion-item:nth-child(2n) {
+    .ia-suggestion-item:nth-child(2n) {{
       background: rgba(15, 23, 42, 0.9);
-    }
+    }}
 
-    .ia-suggestion-item:hover {
+    .ia-suggestion-item:hover {{
       background: rgba(37, 99, 235, 0.25);
-    }
+    }}
 
-    .ia-suggestion-name {
+    .ia-suggestion-name {{
       font-weight: 500;
-    }
+    }}
 
-    .ia-suggestion-meta {
+    .ia-suggestion-meta {{
       color: #9ca3af;
       font-size: 12px;
-    }
+    }}
 
-    .ia-loader {
+    .ia-loader {{
       position: relative;
       margin: 6px 0 4px;
       font-size: 13px;
       color: #e5e7eb;
-    }
+    }}
 
-    .ia-error {
+    .ia-error {{
       position: relative;
       margin: 8px 0 6px;
       padding: 8px 10px;
@@ -1082,9 +1089,9 @@ def widget() -> str:
       border: 1px solid rgba(248, 113, 113, 0.7);
       color: #fecaca;
       font-size: 13px;
-    }
+    }}
 
-    .ia-player-card {
+    .ia-player-card {{
       position: relative;
       display: flex;
       gap: 12px;
@@ -1093,9 +1100,9 @@ def widget() -> str:
       border-radius: 14px;
       background: rgba(15, 23, 42, 0.96);
       border: 1px solid rgba(148, 163, 184, 0.65);
-    }
+    }}
 
-    .ia-player-avatar-wrap {
+    .ia-player-avatar-wrap {{
       flex: 0 0 72px;
       height: 72px;
       border-radius: 999px;
@@ -1105,35 +1112,35 @@ def widget() -> str:
       display: flex;
       align-items: center;
       justify-content: center;
-    }
+    }}
 
-    .ia-player-avatar-initials {
+    .ia-player-avatar-initials {{
       font-size: 22px;
       font-weight: 600;
       color: #e5f4ff;
-    }
+    }}
 
-    .ia-player-info {
+    .ia-player-info {{
       flex: 1;
       display: flex;
       flex-direction: column;
       justify-content: center;
-    }
+    }}
 
-    .ia-player-name-row {
+    .ia-player-name-row {{
       display: flex;
       align-items: center;
       gap: 8px;
       margin-bottom: 4px;
-    }
+    }}
 
-    .ia-player-name {
+    .ia-player-name {{
       font-size: 17px;
       font-weight: 600;
       color: #f9fafb;
-    }
+    }}
 
-    .ia-agg-badge {
+    .ia-agg-badge {{
       font-size: 11px;
       padding: 3px 8px;
       border-radius: 999px;
@@ -1142,74 +1149,74 @@ def widget() -> str:
       gap: 5px;
       text-transform: uppercase;
       letter-spacing: 0.08em;
-    }
+    }}
 
-    .ia-agg-clear {
+    .ia-agg-clear {{
       background: rgba(22, 163, 74, 0.18);
       color: #bbf7d0;
       border: 1px solid rgba(22, 163, 74, 0.6);
-    }
+    }}
 
-    .ia-agg-flagged {
+    .ia-agg-flagged {{
       background: rgba(220, 38, 38, 0.18);
       color: #fecaca;
       border: 1px solid rgba(220, 38, 38, 0.6);
-    }
+    }}
 
-    .ia-agg-dot {
+    .ia-agg-dot {{
       width: 7px;
       height: 7px;
       border-radius: 999px;
       background: currentColor;
-    }
+    }}
 
-    .ia-player-meta-row {
+    .ia-player-meta-row {{
       display: flex;
       align-items: center;
       gap: 6px;
-    }
+    }}
 
-    .ia-team-logo {
+    .ia-team-logo {{
       width: 20px;
       height: 20px;
       border-radius: 4px;
       object-fit: contain;
       background: #020617;
-    }
+    }}
 
-    .ia-player-meta {
+    .ia-player-meta {{
       font-size: 13px;
       color: #cbd5f5;
-    }
+    }}
 
-    .ia-grid {
+    .ia-grid {{
       position: relative;
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 12px;
-    }
+    }}
 
-    @media (max-width: 900px) {
-      .ia-grid {
+    @media (max-width: 900px) {{
+      .ia-grid {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-    }
+      }}
+    }}
 
-    @media (max-width: 600px) {
-      .ia-grid {
+    @media (max-width: 600px) {{
+      .ia-grid {{
         grid-template-columns: minmax(0, 1fr);
-      }
+      }}
 
-      .ia-card {
+      .ia-card {{
         padding: 20px 16px 24px;
-      }
+      }}
 
-      .ia-player-card {
+      .ia-player-card {{
         flex-direction: row;
-      }
-    }
+      }}
+    }}
 
-    .ia-col {
+    .ia-col {{
       background: rgba(15, 23, 42, 0.97);
       border-radius: 12px;
       border: 1px solid rgba(148, 163, 184, 0.6);
@@ -1217,70 +1224,74 @@ def widget() -> str:
       display: flex;
       flex-direction: column;
       overflow: hidden;
-    }
+    }}
 
-    .ia-col-header {
+    .ia-col-header {{
       padding: 6px 9px;
       border-bottom: 1px solid rgba(148, 163, 184, 0.5);
       background: linear-gradient(to right, rgba(30, 64, 175, 0.65), rgba(15, 23, 42, 0.95));
-    }
+    }}
 
-    .ia-col-label {
+    .ia-col-label {{
       font-size: 11px;
       text-transform: uppercase;
       letter-spacing: 0.14em;
       color: #e5e7eb;
-    }
+    }}
 
-    .ia-col-body {
+    .ia-col-body {{
       padding: 8px 9px 10px;
-    }
+    }}
 
-    .ia-col-body p {
+    .ia-col-body p {{
       margin: 0 0 4px;
       font-size: 13px;
-    }
+    }}
 
-    .ia-badge-empty {
+    .ia-badge-empty {{
       display: inline-block;
       padding: 4px 8px;
       border-radius: 999px;
       border: 1px dashed rgba(148, 163, 184, 0.7);
       font-size: 11px;
       color: #9ca3af;
-    }
+    }}
 
-    .ia-note {
+    .ia-note {{
       font-size: 12px;
       color: #9ca3af;
-    }
+    }}
 
-    .ia-note a {
+    .ia-note a {{
       color: #60a5fa;
       text-decoration: none;
-    }
+    }}
 
-    .ia-note a:hover {
+    .ia-note a:hover {{
       text-decoration: underline;
-    }
+    }}
 
-    .ia-status {
+    .ia-status {{
       font-weight: 500;
-    }
+    }}
 
-    .ia-meta {
+    .ia-meta {{
       font-size: 12px;
       color: #9ca3af;
-    }
+    }}
 
-    .ia-footer {
+    .ia-footer {{
       position: relative;
       margin: 16px 0 0;
       font-size: 11px;
       color: #6b7280;
       text-align: right;
-    }
+    }}
   </style>
+  <script>
+    // Liste des joueurs actifs injectée côté backend (aucune requête réseau pour l'auto-complétion).
+    window.__ACTIVE_PLAYERS__ = {players_json};
+  </script>
 </head>
 <body>
   <div id="injury-app">
@@ -1381,9 +1392,10 @@ def widget() -> str:
   </div>
 
   <script>
-    (function () {
-      let ACTIVE_PLAYERS = [];
-      let ACTIVE_PLAYERS_LOADED = false;
+    (function () {{
+      // liste injectée côté backend
+      let ACTIVE_PLAYERS = window.__ACTIVE_PLAYERS__ || [];
+      let ACTIVE_PLAYERS_LOADED = ACTIVE_PLAYERS.length > 0;
 
       const wakeBtn = document.getElementById("ia-wake-btn");
       const wakeStatus = document.getElementById("ia-wake-status");
@@ -1408,59 +1420,59 @@ def widget() -> str:
       const teamLogoEl = document.getElementById("ia-team-logo");
       const playerMetaEl = document.getElementById("ia-player-meta");
 
-      async function wakeService() {
+      async function wakeService() {{
         wakeBtn.disabled = true;
         wakeStatus.textContent = "Réveil en cours… cela peut prendre quelques secondes si le service dormait.";
-        try {
-          const res = await fetch("/health", { method: "GET" });
-          if (!res.ok) {
+        try {{
+          const res = await fetch("/health", {{ method: "GET" }});
+          if (!res.ok) {{
             throw new Error("Health error " + res.status);
-          }
+          }}
           wakeStatus.textContent = "Service réveillé. Tu peux lancer une recherche.";
-        } catch (e) {
+        }} catch (e) {{
           console.error(e);
           wakeStatus.textContent = "Impossible de réveiller le service (réessaie ou rafraîchis la page).";
           wakeBtn.disabled = false;
-        }
-      }
+        }}
+      }}
 
-      function setLoading(isLoading) {
+      function setLoading(isLoading) {{
         loader.style.display = isLoading ? "block" : "none";
         button.disabled = isLoading;
-      }
+      }}
 
-      function setError(message) {
-        if (!message) {
+      function setError(message) {{
+        if (!message) {{
           errorBox.style.display = "none";
           errorBox.textContent = "";
-        } else {
+        }} else {{
           errorBox.style.display = "block";
           errorBox.textContent = message;
-        }
-      }
+        }}
+      }}
 
-      function clearSources() {
+      function clearSources() {{
         srcBdl.innerHTML = "";
         srcEspn.innerHTML = "";
         srcCbs.innerHTML = "";
-      }
+      }}
 
-      function renderEmpty(el) {
+      function renderEmpty(el) {{
         el.innerHTML = '<span class="ia-badge-empty">Aucune info</span>';
-      }
+      }}
 
-      function closeSuggestions() {
+      function closeSuggestions() {{
         suggBox.style.display = "none";
         suggBox.innerHTML = "";
-      }
+      }}
 
-      function openSuggestions(items) {
-        if (!items.length) {
+      function openSuggestions(items) {{
+        if (!items.length) {{
           closeSuggestions();
           return;
-        }
+        }}
         suggBox.innerHTML = "";
-        items.slice(0, 8).forEach(function (p) {
+        items.slice(0, 8).forEach(function (p) {{
           const div = document.createElement("div");
           div.className = "ia-suggestion-item";
           const left = document.createElement("div");
@@ -1469,7 +1481,7 @@ def widget() -> str:
 
           const right = document.createElement("div");
           right.className = "ia-suggestion-meta";
-          const team = p.team || {};
+          const team = p.team || {{}};
           const parts = [];
           if (team.abbreviation) parts.push(team.abbreviation);
           if (p.position) parts.push(p.position);
@@ -1478,64 +1490,50 @@ def widget() -> str:
           div.appendChild(left);
           div.appendChild(right);
 
-          div.addEventListener("click", function () {
+          div.addEventListener("click", function () {{
             const name = p.full_name || (p.first_name + " " + p.last_name);
             input.value = name;
             closeSuggestions();
             searchPlayer();
-          });
+          }});
 
           suggBox.appendChild(div);
-        });
+        }});
         suggBox.style.display = "block";
-      }
+      }}
 
-      async function ensureActivePlayersLoaded() {
-        if (ACTIVE_PLAYERS_LOADED) return;
-        try {
-          const res = await fetch("/players/active/local", { method: "GET" });
-          if (!res.ok) throw new Error("Active players error " + res.status);
-          const data = await res.json();
-          ACTIVE_PLAYERS = data.players || [];
-          ACTIVE_PLAYERS_LOADED = true;
-        } catch (e) {
-          console.error("Erreur chargement joueurs actifs", e);
-        }
-      }
-
-      async function fetchSuggestionsLocal(q) {
-        if (q.length < 3) {
+      function fetchSuggestionsLocal(q) {{
+        if (q.length < 3) {{
           closeSuggestions();
           return;
-        }
-        await ensureActivePlayersLoaded();
-        if (!ACTIVE_PLAYERS.length) {
+        }}
+        if (!ACTIVE_PLAYERS_LOADED || !ACTIVE_PLAYERS.length) {{
           closeSuggestions();
           return;
-        }
+        }}
         const qLower = q.toLowerCase();
-        const filtered = ACTIVE_PLAYERS.filter(function (p) {
+        const filtered = ACTIVE_PLAYERS.filter(function (p) {{
           const fn = p.full_name || (p.first_name + " " + p.last_name);
           return fn.toLowerCase().includes(qLower);
-        });
+        }});
         openSuggestions(filtered);
-      }
+      }}
 
-      function buildTeamLogoUrl(abbrev) {
+      function buildTeamLogoUrl(abbrev) {{
         if (!abbrev) return "";
         return (
           "https://a.espncdn.com/i/teamlogos/nba/500/scoreboard/" +
           abbrev.toLowerCase() +
           ".png"
         );
-      }
+      }}
 
-      async function searchPlayer() {
+      async function searchPlayer() {{
         const name = (input.value || "").trim();
-        if (!name) {
+        if (!name) {{
           setError("Merci d’entrer un nom de joueur.");
           return;
-        }
+        }}
 
         setError("");
         results.style.display = "none";
@@ -1544,65 +1542,65 @@ def widget() -> str:
         closeSuggestions();
         playerCard.style.display = "none";
 
-        try {
+        try {{
           const url =
             "/injuries/by-player?name=" +
             encodeURIComponent(name);
-          const res = await fetch(url, { method: "GET" });
-          if (!res.ok) {
+          const res = await fetch(url, {{ method: "GET" }});
+          if (!res.ok) {{
             throw new Error("API error " + res.status);
-          }
+          }}
           const data = await res.json();
           renderResults(data);
-        } catch (e) {
+        }} catch (e) {{
           console.error(e);
           setError(
             "Impossible de récupérer les données de blessures."
           );
-        } finally {
+        }} finally {{
           setLoading(false);
-        }
-      }
+        }}
+      }}
 
-      function computeInitials(fullName) {
+      function computeInitials(fullName) {{
         if (!fullName) return "";
         const parts = fullName.trim().split(/\\s+/);
-        if (parts.length === 1) {
+        if (parts.length === 1) {{
           return parts[0].charAt(0).toUpperCase();
-        }
+        }}
         return (
           parts[0].charAt(0).toUpperCase() +
           parts[parts.length - 1].charAt(0).toUpperCase()
         );
-      }
+      }}
 
-      function renderAggregatedBadge(aggregated) {
-        if (!aggregated) {
+      function renderAggregatedBadge(aggregated) {{
+        if (!aggregated) {{
           playerAggEl.style.display = "none";
           playerAggEl.textContent = "";
           playerAggEl.classList.remove("ia-agg-clear", "ia-agg-flagged");
           return;
-        }
+        }}
         const status = aggregated.status || "clear";
         playerAggEl.classList.remove("ia-agg-clear", "ia-agg-flagged");
 
-        if (status === "clear") {
+        if (status === "clear") {{
           playerAggEl.classList.add("ia-agg-clear");
           playerAggEl.innerHTML =
             '<span class="ia-agg-dot"></span><span>OK · Aucune info blessure</span>';
-        } else {
+        }} else {{
           playerAggEl.classList.add("ia-agg-flagged");
           playerAggEl.innerHTML =
             '<span class="ia-agg-dot"></span><span>ALERTE · Blessé / incertain</span>';
-        }
+        }}
         playerAggEl.style.display = "inline-flex";
-      }
+      }}
 
-      function renderPlayerCard(bdlPlayer, aggregated) {
-        if (!bdlPlayer) {
+      function renderPlayerCard(bdlPlayer, aggregated) {{
+        if (!bdlPlayer) {{
           playerCard.style.display = "none";
           return;
-        }
+        }}
         const fullName = bdlPlayer.full_name ||
           (bdlPlayer.first_name + " " + bdlPlayer.last_name);
         playerNameEl.textContent = fullName;
@@ -1612,27 +1610,27 @@ def widget() -> str:
 
         renderAggregatedBadge(aggregated);
 
-        const team = bdlPlayer.team || {};
+        const team = bdlPlayer.team || {{}};
         const metaParts = [];
         if (team.name) metaParts.push(team.name);
         if (bdlPlayer.position) metaParts.push(bdlPlayer.position);
         playerMetaEl.textContent = metaParts.join(" · ");
 
         const logoUrl = buildTeamLogoUrl(team.abbreviation);
-        if (logoUrl) {
+        if (logoUrl) {{
           teamLogoEl.style.display = "block";
           teamLogoEl.src = logoUrl;
-          teamLogoEl.onerror = function () {
+          teamLogoEl.onerror = function () {{
             this.style.display = "none";
-          };
-        } else {
+          }};
+        }} else {{
           teamLogoEl.style.display = "none";
-        }
+        }}
 
         playerCard.style.display = "flex";
-      }
+      }}
 
-      function renderResults(data) {
+      function renderResults(data) {{
         results.style.display = "block";
         clearSources();
 
@@ -1641,9 +1639,9 @@ def widget() -> str:
         renderPlayerCard(bdlPlayer, aggregated);
 
         const bdlInj = (data.sources?.balldontlie?.injuries || [])[0];
-        if (!bdlInj) {
+        if (!bdlInj) {{
           renderEmpty(srcBdl);
-        } else {
+        }} else {{
           const status = bdlInj.status || "N/A";
           const ret = bdlInj.return_date || "";
           srcBdl.innerHTML =
@@ -1654,12 +1652,12 @@ def widget() -> str:
             (bdlInj.description
               ? '<p class="ia-meta">' + bdlInj.description + "</p>"
               : "");
-        }
+        }}
 
         const espnInj = (data.sources?.espn?.injuries || [])[0];
-        if (!espnInj) {
+        if (!espnInj) {{
           renderEmpty(srcEspn);
-        } else {
+        }} else {{
           srcEspn.innerHTML =
             '<p class="ia-status">' +
             (espnInj.status || "N/A") +
@@ -1670,12 +1668,12 @@ def widget() -> str:
             (espnInj.comment
               ? '<p class="ia-meta">' + espnInj.comment + "</p>"
               : "");
-        }
+        }}
 
         const cbsInj = (data.sources?.cbs?.injuries || [])[0];
-        if (!cbsInj) {
+        if (!cbsInj) {{
           renderEmpty(srcCbs);
-        } else {
+        }} else {{
           srcCbs.innerHTML =
             '<p class="ia-status">' +
             (cbsInj.status || "N/A") +
@@ -1684,38 +1682,38 @@ def widget() -> str:
             (cbsInj.injury || "Injury non précisée") +
             (cbsInj.updated ? " · maj " + cbsInj.updated : "") +
             "</p>";
-        }
-      }
+        }}
+      }}
 
       wakeBtn.addEventListener("click", wakeService);
 
       button.addEventListener("click", searchPlayer);
 
-      input.addEventListener("keydown", function (e) {
-        if (e.key === "Enter") {
+      input.addEventListener("keydown", function (e) {{
+        if (e.key === "Enter") {{
           searchPlayer();
-        }
-        if (e.key === "Escape") {
+        }}
+        if (e.key === "Escape") {{
           closeSuggestions();
-        }
-      });
+        }}
+      }});
 
-      input.addEventListener("input", function () {
+      input.addEventListener("input", function () {{
         const q = (input.value || "").trim();
-        if (suggTimeout) {
+        if (suggTimeout) {{
           clearTimeout(suggTimeout);
-        }
-        suggTimeout = setTimeout(function () {
+        }}
+        suggTimeout = setTimeout(function () {{
           fetchSuggestionsLocal(q);
-        }, 150);
-      });
+        }}, 150);
+      }});
 
-      document.addEventListener("click", function (e) {
-        if (!suggBox.contains(e.target) && e.target !== input) {
+      document.addEventListener("click", function (e) {{
+        if (!suggBox.contains(e.target) && e.target !== input) {{
           closeSuggestions();
-        }
-      });
-    })();
+        }}
+      }});
+    }})();
   </script>
 </body>
 </html>
