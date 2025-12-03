@@ -931,6 +931,39 @@ def widget() -> str:
       text-align: center;
     }
 
+    .ia-wake-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    #ia-wake-btn {
+      padding: 7px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(148, 163, 184, 0.7);
+      background: rgba(15, 23, 42, 0.96);
+      color: #e5e7eb;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    #ia-wake-btn:hover:not(:disabled) {
+      background: rgba(30, 64, 175, 0.8);
+      border-color: rgba(96, 165, 250, 0.8);
+    }
+
+    #ia-wake-btn:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+
+    .ia-wake-status {
+      font-size: 11px;
+      color: #9ca3af;
+    }
+
     .ia-search {
       position: relative;
       margin-bottom: 10px;
@@ -1258,6 +1291,13 @@ def widget() -> str:
           Agrégateur d'informations sur le statut des joueurs NBA.
         </p>
 
+        <div class="ia-wake-row">
+          <button id="ia-wake-btn" type="button">Réveiller le service</button>
+          <div id="ia-wake-status" class="ia-wake-status">
+            Utilise ce bouton si la première recherche semble lente.
+          </div>
+        </div>
+
         <div class="ia-search">
           <div class="ia-search-input-wrap">
             <input
@@ -1345,6 +1385,9 @@ def widget() -> str:
       let ACTIVE_PLAYERS = [];
       let ACTIVE_PLAYERS_LOADED = false;
 
+      const wakeBtn = document.getElementById("ia-wake-btn");
+      const wakeStatus = document.getElementById("ia-wake-status");
+
       const input = document.getElementById("ia-player-input");
       const button = document.getElementById("ia-search-btn");
       const loader = document.getElementById("ia-loader");
@@ -1364,6 +1407,22 @@ def widget() -> str:
       const playerAggEl = document.getElementById("ia-player-agg");
       const teamLogoEl = document.getElementById("ia-team-logo");
       const playerMetaEl = document.getElementById("ia-player-meta");
+
+      async function wakeService() {
+        wakeBtn.disabled = true;
+        wakeStatus.textContent = "Réveil en cours… cela peut prendre quelques secondes si le service dormait.";
+        try {
+          const res = await fetch("/health", { method: "GET" });
+          if (!res.ok) {
+            throw new Error("Health error " + res.status);
+          }
+          wakeStatus.textContent = "Service réveillé. Tu peux lancer une recherche.";
+        } catch (e) {
+          console.error(e);
+          wakeStatus.textContent = "Impossible de réveiller le service (réessaie ou rafraîchis la page).";
+          wakeBtn.disabled = false;
+        }
+      }
 
       function setLoading(isLoading) {
         loader.style.display = isLoading ? "block" : "none";
@@ -1627,6 +1686,8 @@ def widget() -> str:
             "</p>";
         }
       }
+
+      wakeBtn.addEventListener("click", wakeService);
 
       button.addEventListener("click", searchPlayer);
 
