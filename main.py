@@ -1,15 +1,14 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from typing import Optional, Dict, Any, List, Tuple
 import os
 import requests
 from bs4 import BeautifulSoup  # parser HTML (ESPN, NBC, CBS)
 
-from fastapi.middleware.cors import CORSMiddleware
-
 app = FastAPI()
 
-# CORS : autorise les appels depuis Carrd (tous domaines pour l'instant).
-# Tu pourras remplacer "*" par ["https://tonsite.carrd.co"] plus tard.
+# CORS : utile si tu appelles l’API depuis ailleurs, mais pour /widget (même origine) ce n’est plus critique.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -93,9 +92,6 @@ def _call_balldontlie(
     params: Optional[Dict[str, Any]] = None,
     timeout: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Appelle un endpoint BallDontLie (NBA) et renvoie le JSON.
-    """
     api_key = _get_balldontlie_api_key()
     base_url = "https://api.balldontlie.io"
     url = f"{base_url}{path}"
@@ -131,9 +127,6 @@ def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[st
 
 
 def _map_balldontlie_injury(item: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Simplifie un enregistrement injury BallDontLie.
-    """
     player = item.get("player") or {}
     team = player.get("team") or {}
 
@@ -184,12 +177,8 @@ def injuries_balldontlie(
 
 @app.get("/balldontlie/player/{player_id}")
 def balldontlie_player(player_id: int) -> Dict[str, Any]:
-    """
-    Wrapper {"data": {...}} pour /v1/players/{id}.
-    """
     resp = _call_balldontlie(f"/v1/players/{player_id}")
     data = resp.get("data") or {}
-
     player_team = data.get("team") or {}
 
     full_name = data.get("full_name")
@@ -216,9 +205,6 @@ def balldontlie_player(player_id: int) -> Dict[str, Any]:
 
 @app.get("/players/balldontlie/search")
 def players_balldontlie_search(query: str, per_page: int = 25) -> Dict[str, Any]:
-    """
-    Expose /v1/players?search= pour debug / frontend.
-    """
     params = {"search": query, "per_page": per_page}
     resp = _call_balldontlie("/v1/players", params=params)
     data = resp.get("data", [])
@@ -263,10 +249,6 @@ def injuries_balldontlie_by_player_id(
     player_id: int,
     per_page: int = 50,
 ) -> Dict[str, Any]:
-    """
-    Renvoie SEULEMENT les blessures BallDontLie pour un joueur donné
-    en filtrant localement sur player.id.
-    """
     params: Dict[str, Any] = {
         "per_page": per_page,
     }
@@ -320,9 +302,6 @@ def _fetch_espn_html() -> str:
 
 
 def _parse_espn_injuries(html: str) -> List[Dict[str, Any]]:
-    """
-    Parse les tableaux ESPN (NAME / POS / EST. RETURN DATE / STATUS / COMMENT).
-    """
     soup = BeautifulSoup(html, "html.parser")
 
     results: List[Dict[str, Any]] = []
@@ -421,10 +400,6 @@ def _fetch_nbc_html() -> str:
 
 
 def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
-    """
-    Tentative de parsing NBC. Pour l'instant, la page ne contient pas
-    de tableau HTML statique exploitable dans l'HTML brut.
-    """
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
 
@@ -519,11 +494,6 @@ def _fetch_cbs_html() -> str:
 
 
 def _clean_cbs_player_name(raw: str) -> str:
-    """
-    CBS concatène abréviation + nom complet : ex. 'K. PorzingisKristaps Porzingis'.
-    On cherche la première transition 'minuscule' -> 'majuscule' sans espace
-    et on garde la partie droite comme nom complet.
-    """
     s = raw.strip()
     split_idx = None
     for i in range(1, len(s)):
@@ -540,10 +510,6 @@ def _clean_cbs_player_name(raw: str) -> str:
 
 
 def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
-    """
-    Parse les tableaux CBS (Player / Position / Updated / Injury / Injury Status),
-    en nettoyant player_name pour ne garder que le nom complet.
-    """
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
 
@@ -629,10 +595,6 @@ def _normalize_full_name(p: Dict[str, Any]) -> str:
 
 
 def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Essaie nom complet, nom de famille, puis prénom pour trouver le meilleur
-    joueur BallDontLie.
-    """
     name = name.strip()
     if not name:
         return None, []
@@ -681,13 +643,6 @@ def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[D
 
 @app.get("/injuries/by-player")
 def injuries_by_player(name: str) -> Dict[str, Any]:
-    """
-    Agrège les infos par joueur sans les fusionner :
-    - BallDontLie : joueur correspondant + blessures associées.
-    - ESPN : lignes d'injuries dont le nom matche.
-    - NBC : lignes d'injuries (souvent vide pour l’instant).
-    - CBS : lignes d'injuries dont le nom matche.
-    """
     query = name.strip()
     if not query:
         raise HTTPException(status_code=400, detail="name parameter must not be empty")
@@ -771,3 +726,743 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
             },
         },
     }
+
+
+# ============================================================
+#                        UI WIDGET HTML
+# ============================================================
+
+@app.get("/widget", response_class=HTMLResponse)
+def widget() -> str:
+    """
+    Petite page HTML autonome (dark, auto-complétion, tuiles) qui consomme
+    directement les endpoints de cette API. À embed dans Carrd via iframe.
+    """
+    return """
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>NBA Injuries Radar</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background: #020617;
+      color: #e5e7eb;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+        "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+
+    #injury-app {
+      color: #e5e7eb;
+    }
+
+    .ia-shell {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 28px 12px 40px;
+    }
+
+    .ia-card {
+      position: relative;
+      padding: 24px 20px 26px;
+      border-radius: 20px;
+      background: radial-gradient(circle at top left, #1e293b 0, #020617 45%, #000 100%);
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      box-shadow:
+        0 32px 80px rgba(0, 0, 0, 0.75),
+        0 0 0 1px rgba(15, 23, 42, 0.65);
+      overflow: hidden;
+    }
+
+    .ia-card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      opacity: 0.4;
+      background:
+        radial-gradient(circle at 0 0, rgba(59, 130, 246, 0.32) 0, transparent 55%),
+        radial-gradient(circle at 100% 0, rgba(147, 51, 234, 0.28) 0, transparent 50%);
+      pointer-events: none;
+    }
+
+    .ia-title {
+      position: relative;
+      margin: 0 0 4px;
+      font-size: 26px;
+      font-weight: 650;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #f9fafb;
+    }
+
+    .ia-subtitle {
+      position: relative;
+      margin: 0 0 18px;
+      font-size: 13px;
+      color: #9ca3af;
+    }
+
+    .ia-search {
+      position: relative;
+      margin-bottom: 10px;
+      display: flex;
+      gap: 10px;
+      z-index: 2;
+    }
+
+    .ia-search-input-wrap {
+      position: relative;
+      flex: 1;
+    }
+
+    #ia-player-input {
+      width: 100%;
+      padding: 11px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.65);
+      background: rgba(15, 23, 42, 0.96);
+      color: #f9fafb;
+      font-size: 14px;
+      outline: none;
+    }
+
+    #ia-player-input::placeholder {
+      color: #6b7280;
+    }
+
+    #ia-player-input:focus {
+      border-color: #60a5fa;
+      box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.7);
+    }
+
+    #ia-search-btn {
+      padding: 11px 16px;
+      border-radius: 10px;
+      border: none;
+      background: linear-gradient(to right, #2563eb, #4f46e5);
+      color: #f9fafb;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      white-space: nowrap;
+      box-shadow: 0 12px 25px rgba(37, 99, 235, 0.45);
+    }
+
+    #ia-search-btn:disabled {
+      opacity: 0.6;
+      cursor: default;
+      box-shadow: none;
+    }
+
+    #ia-search-btn:hover:not(:disabled) {
+      background: linear-gradient(to right, #1d4ed8, #4338ca);
+    }
+
+    .ia-suggestions {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(100% + 4px);
+      max-height: 220px;
+      overflow-y: auto;
+      background: #020617;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.7);
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.9);
+      z-index: 50;
+    }
+
+    .ia-suggestion-item {
+      padding: 7px 10px;
+      font-size: 13px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .ia-suggestion-item:nth-child(2n) {
+      background: rgba(15, 23, 42, 0.9);
+    }
+
+    .ia-suggestion-item:hover {
+      background: rgba(37, 99, 235, 0.25);
+    }
+
+    .ia-suggestion-name {
+      font-weight: 500;
+    }
+
+    .ia-suggestion-meta {
+      color: #9ca3af;
+      font-size: 12px;
+    }
+
+    .ia-loader {
+      position: relative;
+      margin: 6px 0 4px;
+      font-size: 13px;
+      color: #e5e7eb;
+    }
+
+    .ia-error {
+      position: relative;
+      margin: 8px 0 6px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: rgba(248, 113, 113, 0.1);
+      border: 1px solid rgba(248, 113, 113, 0.7);
+      color: #fecaca;
+      font-size: 13px;
+    }
+
+    .ia-player-card {
+      position: relative;
+      display: flex;
+      gap: 12px;
+      padding: 10px 10px;
+      margin: 10px 0 16px;
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.96);
+      border: 1px solid rgba(148, 163, 184, 0.65);
+    }
+
+    .ia-player-photo-wrap {
+      flex: 0 0 72px;
+      height: 72px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #0b1220;
+      border: 1px solid rgba(148, 163, 184, 0.8);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .ia-player-photo {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .ia-player-info {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    .ia-player-name-row {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-bottom: 2px;
+    }
+
+    .ia-player-name {
+      font-size: 17px;
+      font-weight: 600;
+      color: #f9fafb;
+    }
+
+    .ia-player-age {
+      font-size: 12px;
+      color: #9ca3af;
+    }
+
+    .ia-player-meta-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .ia-team-logo {
+      width: 20px;
+      height: 20px;
+      border-radius: 4px;
+      object-fit: contain;
+      background: #020617;
+    }
+
+    .ia-player-meta {
+      font-size: 13px;
+      color: #cbd5f5;
+    }
+
+    .ia-grid {
+      position: relative;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    @media (max-width: 900px) {
+      .ia-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 600px) {
+      .ia-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .ia-card {
+        padding: 20px 16px 24px;
+      }
+
+      .ia-player-card {
+        flex-direction: row;
+      }
+    }
+
+    .ia-col {
+      background: rgba(15, 23, 42, 0.97);
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.6);
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .ia-col-header {
+      padding: 6px 9px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.5);
+      background: linear-gradient(to right, rgba(30, 64, 175, 0.65), rgba(15, 23, 42, 0.95));
+    }
+
+    .ia-col-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: #e5e7eb;
+    }
+
+    .ia-col-body {
+      padding: 8px 9px 10px;
+    }
+
+    .ia-col-body p {
+      margin: 0 0 4px;
+      font-size: 13px;
+    }
+
+    .ia-badge-empty {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px dashed rgba(148, 163, 184, 0.7);
+      font-size: 11px;
+      color: #9ca3af;
+    }
+
+    .ia-note {
+      font-size: 12px;
+      color: #9ca3af;
+    }
+
+    .ia-note a {
+      color: #60a5fa;
+      text-decoration: none;
+    }
+
+    .ia-note a:hover {
+      text-decoration: underline;
+    }
+
+    .ia-status {
+      font-weight: 500;
+    }
+
+    .ia-meta {
+      font-size: 12px;
+      color: #9ca3af;
+    }
+
+    .ia-footer {
+      position: relative;
+      margin: 16px 0 0;
+      font-size: 11px;
+      color: #6b7280;
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+  <div id="injury-app">
+    <div class="ia-shell">
+      <div class="ia-card">
+        <h1 class="ia-title">NBA Injuries Radar</h1>
+        <p class="ia-subtitle">
+          Recherche un joueur NBA pour comparer les infos BallDontLie, ESPN et CBS.
+        </p>
+
+        <div class="ia-search">
+          <div class="ia-search-input-wrap">
+            <input
+              id="ia-player-input"
+              type="text"
+              placeholder="Rechercher un joueur (ex : Kristaps Porzingis)"
+              autocomplete="off"
+            />
+            <div id="ia-suggestions" class="ia-suggestions" style="display:none;"></div>
+          </div>
+          <button id="ia-search-btn">Chercher</button>
+        </div>
+
+        <div id="ia-loader" class="ia-loader" style="display:none;">
+          Recherche en cours...
+        </div>
+        <div id="ia-error" class="ia-error" style="display:none;"></div>
+
+        <div id="ia-results" class="ia-results" style="display:none;">
+
+          <div id="ia-player-card" class="ia-player-card" style="display:none;">
+            <div class="ia-player-photo-wrap">
+              <img id="ia-player-photo" class="ia-player-photo" alt="Player photo" />
+            </div>
+            <div class="ia-player-info">
+              <div class="ia-player-name-row">
+                <span id="ia-player-name" class="ia-player-name"></span>
+                <span id="ia-player-age" class="ia-player-age"></span>
+              </div>
+              <div class="ia-player-meta-row">
+                <img id="ia-team-logo" class="ia-team-logo" alt="Team logo" />
+                <span id="ia-player-meta" class="ia-player-meta"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="ia-grid">
+            <div class="ia-col" id="ia-src-bdl">
+              <div class="ia-col-header">
+                <span class="ia-col-label">BallDontLie</span>
+              </div>
+              <div class="ia-col-body"></div>
+            </div>
+            <div class="ia-col" id="ia-src-espn">
+              <div class="ia-col-header">
+                <span class="ia-col-label">ESPN</span>
+              </div>
+              <div class="ia-col-body"></div>
+            </div>
+            <div class="ia-col" id="ia-src-cbs">
+              <div class="ia-col-header">
+                <span class="ia-col-label">CBS</span>
+              </div>
+              <div class="ia-col-body"></div>
+            </div>
+            <div class="ia-col" id="ia-src-nbc">
+              <div class="ia-col-header">
+                <span class="ia-col-label">NBC (manuel)</span>
+              </div>
+              <div class="ia-col-body">
+                <p class="ia-note">
+                  NBC est chargé dynamiquement. Vérifie directement&nbsp;:
+                  <a href="https://www.nbcsports.com/nba/nba-injuries-nbc-sports" target="_blank" rel="noopener">
+                    NBC Injuries
+                  </a>
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <p class="ia-footer">
+          Données live&nbsp;: BallDontLie, ESPN, CBS.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const input = document.getElementById("ia-player-input");
+      const button = document.getElementById("ia-search-btn");
+      const loader = document.getElementById("ia-loader");
+      const errorBox = document.getElementById("ia-error");
+      const results = document.getElementById("ia-results");
+
+      const srcBdl = document.querySelector("#ia-src-bdl .ia-col-body");
+      const srcEspn = document.querySelector("#ia-src-espn .ia-col-body");
+      const srcCbs = document.querySelector("#ia-src-cbs .ia-col-body");
+
+      const suggBox = document.getElementById("ia-suggestions");
+      let suggTimeout = null;
+
+      const playerCard = document.getElementById("ia-player-card");
+      const playerPhoto = document.getElementById("ia-player-photo");
+      const playerNameEl = document.getElementById("ia-player-name");
+      const playerAgeEl = document.getElementById("ia-player-age");
+      const teamLogoEl = document.getElementById("ia-team-logo");
+      const playerMetaEl = document.getElementById("ia-player-meta");
+
+      function setLoading(isLoading) {
+        loader.style.display = isLoading ? "block" : "none";
+        button.disabled = isLoading;
+      }
+
+      function setError(message) {
+        if (!message) {
+          errorBox.style.display = "none";
+          errorBox.textContent = "";
+        } else {
+          errorBox.style.display = "block";
+          errorBox.textContent = message;
+        }
+      }
+
+      function clearSources() {
+        srcBdl.innerHTML = "";
+        srcEspn.innerHTML = "";
+        srcCbs.innerHTML = "";
+      }
+
+      function renderEmpty(el) {
+        el.innerHTML = '<span class="ia-badge-empty">Aucune info</span>';
+      }
+
+      function closeSuggestions() {
+        suggBox.style.display = "none";
+        suggBox.innerHTML = "";
+      }
+
+      function openSuggestions(items) {
+        if (!items.length) {
+          closeSuggestions();
+          return;
+        }
+        suggBox.innerHTML = "";
+        items.slice(0, 8).forEach(function (p) {
+          const div = document.createElement("div");
+          div.className = "ia-suggestion-item";
+          const left = document.createElement("div");
+          left.className = "ia-suggestion-name";
+          left.textContent = p.full_name || (p.first_name + " " + p.last_name);
+
+          const right = document.createElement("div");
+          right.className = "ia-suggestion-meta";
+          const team = p.team || {};
+          const parts = [];
+          if (team.abbreviation) parts.push(team.abbreviation);
+          if (p.position) parts.push(p.position);
+          right.textContent = parts.join(" · ");
+
+          div.appendChild(left);
+          div.appendChild(right);
+
+          div.addEventListener("click", function () {
+            const name = p.full_name || (p.first_name + " " + p.last_name);
+            input.value = name;
+            closeSuggestions();
+            searchPlayer();
+          });
+
+          suggBox.appendChild(div);
+        });
+        suggBox.style.display = "block";
+      }
+
+      async function fetchSuggestions(q) {
+        if (q.length < 3) {
+          closeSuggestions();
+          return;
+        }
+        try {
+          const url =
+            "/players/balldontlie/search?query=" +
+            encodeURIComponent(q);
+          const res = await fetch(url, { method: "GET" });
+          if (!res.ok) return;
+          const data = await res.json();
+          openSuggestions(data.players || []);
+        } catch (e) {
+          console.error("Erreur suggestions", e);
+        }
+      }
+
+      function buildHeadshotUrl(firstName, lastName) {
+        if (!firstName || !lastName) return "";
+        const fn = firstName.toLowerCase().replace(/\\s+/g, "_");
+        const ln = lastName.toLowerCase().replace(/\\s+/g, "_");
+        return "https://nba-players.herokuapp.com/players/" + ln + "/" + fn;
+      }
+
+      function buildTeamLogoUrl(abbrev) {
+        if (!abbrev) return "";
+        return (
+          "https://a.espncdn.com/i/teamlogos/nba/500/scoreboard/" +
+          abbrev.toLowerCase() +
+          ".png"
+        );
+      }
+
+      async function searchPlayer() {
+        const name = (input.value || "").trim();
+        if (!name) {
+          setError("Merci d’entrer un nom de joueur.");
+          return;
+        }
+
+        setError("");
+        results.style.display = "none";
+        clearSources();
+        setLoading(true);
+        closeSuggestions();
+        playerCard.style.display = "none";
+
+        try {
+          const url =
+            "/injuries/by-player?name=" +
+            encodeURIComponent(name);
+          const res = await fetch(url, { method: "GET" });
+          if (!res.ok) {
+            throw new Error("API error " + res.status);
+          }
+          const data = await res.json();
+          renderResults(data);
+        } catch (e) {
+          console.error(e);
+          setError(
+            "Impossible de récupérer les données de blessures."
+          );
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      function renderPlayerCard(bdlPlayer) {
+        if (!bdlPlayer) {
+          playerCard.style.display = "none";
+          return;
+        }
+        const fullName = bdlPlayer.full_name ||
+          (bdlPlayer.first_name + " " + bdlPlayer.last_name);
+        playerNameEl.textContent = fullName;
+
+        playerAgeEl.textContent = "";
+
+        const team = bdlPlayer.team || {};
+        const metaParts = [];
+        if (team.name) metaParts.push(team.name);
+        if (bdlPlayer.position) metaParts.push(bdlPlayer.position);
+        playerMetaEl.textContent = metaParts.join(" · ");
+
+        const headshotUrl = buildHeadshotUrl(
+          bdlPlayer.first_name,
+          bdlPlayer.last_name
+        );
+        if (headshotUrl) {
+          playerPhoto.style.display = "block";
+          playerPhoto.src = headshotUrl;
+          playerPhoto.onerror = function () {
+            this.style.display = "none";
+          };
+        } else {
+          playerPhoto.style.display = "none";
+        }
+
+        const logoUrl = buildTeamLogoUrl(team.abbreviation);
+        if (logoUrl) {
+          teamLogoEl.style.display = "block";
+          teamLogoEl.src = logoUrl;
+          teamLogoEl.onerror = function () {
+            this.style.display = "none";
+          };
+        } else {
+          teamLogoEl.style.display = "none";
+        }
+
+        playerCard.style.display = "flex";
+      }
+
+      function renderResults(data) {
+        results.style.display = "block";
+        clearSources();
+
+        const bdlPlayer = data.sources?.balldontlie?.matched_player || null;
+        renderPlayerCard(bdlPlayer);
+
+        const bdlInj = (data.sources?.balldontlie?.injuries || [])[0];
+        if (!bdlInj) {
+          renderEmpty(srcBdl);
+        } else {
+          const status = bdlInj.status || "N/A";
+          const ret = bdlInj.return_date || "";
+          srcBdl.innerHTML =
+            '<p class="ia-status">' +
+            status +
+            (ret ? " · retour estimé " + ret : "") +
+            "</p>" +
+            (bdlInj.description
+              ? '<p class="ia-meta">' + bdlInj.description + "</p>"
+              : "");
+        }
+
+        const espnInj = (data.sources?.espn?.injuries || [])[0];
+        if (!espnInj) {
+          renderEmpty(srcEspn);
+        } else {
+          srcEspn.innerHTML =
+            '<p class="ia-status">' +
+            (espnInj.status || "N/A") +
+            (espnInj.est_return_date
+              ? " · retour estimé " + espnInj.est_return_date
+              : "") +
+            "</p>" +
+            (espnInj.comment
+              ? '<p class="ia-meta">' + espnInj.comment + "</p>"
+              : "");
+        }
+
+        const cbsInj = (data.sources?.cbs?.injuries || [])[0];
+        if (!cbsInj) {
+          renderEmpty(srcCbs);
+        } else {
+          srcCbs.innerHTML =
+            '<p class="ia-status">' +
+            (cbsInj.status || "N/A") +
+            "</p>" +
+            '<p class="ia-meta">' +
+            (cbsInj.injury || "Injury non précisée") +
+            (cbsInj.updated ? " · maj " + cbsInj.updated : "") +
+            "</p>";
+        }
+      }
+
+      button.addEventListener("click", searchPlayer);
+
+      input.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") {
+          searchPlayer();
+        }
+        if (e.key === "Escape") {
+          closeSuggestions();
+        }
+      });
+
+      input.addEventListener("input", function () {
+        const q = (input.value || "").trim();
+        if (suggTimeout) {
+          clearTimeout(suggTimeout);
+        }
+        suggTimeout = setTimeout(function () {
+          fetchSuggestions(q);
+        }, 220);
+      });
+
+      document.addEventListener("click", function (e) {
+        if (!suggBox.contains(e.target) && e.target !== input) {
+          closeSuggestions();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
+    """
