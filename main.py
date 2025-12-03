@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from typing import Optional, Dict, Any, List
 import os
 import requests
-from bs4 import BeautifulSoup  # pour parser l'HTML ESPN [web:131][web:134]
+from bs4 import BeautifulSoup  # parser HTML ESPN
 
 app = FastAPI()
 
@@ -62,7 +62,9 @@ def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
     return example_response
 
 
-# ---------- Helpers BallDontLie ----------
+# ============================================================
+#                       BALLDONTLIE
+# ============================================================
 
 def _get_balldontlie_api_key() -> str:
     api_key = os.getenv("BALLDONTLIE_API_KEY")
@@ -79,6 +81,9 @@ def _call_balldontlie(
     params: Optional[Dict[str, Any]] = None,
     timeout: int = 10,
 ) -> Dict[str, Any]:
+    """
+    Appelle un endpoint BallDontLie (NBA) et renvoie le JSON. [web:101]
+    """
     api_key = _get_balldontlie_api_key()
     base_url = "https://api.balldontlie.io"
     url = f"{base_url}{path}"
@@ -98,7 +103,7 @@ def _call_balldontlie(
     return resp.json()
 
 
-# ---------- BallDontLie : raw injuries ----------
+# ---- Injuries (brut) ----
 
 @app.get("/balldontlie/raw")
 def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[str, Any]:
@@ -117,15 +122,26 @@ def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[st
 
 def _map_balldontlie_injury(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Ici, item est déjà un objet injury (sans wrapper data). [web:101]
+    Simplifie un enregistrement injury BallDontLie.
+    Le schéma indique un objet `player` avec les infos de base. [web:43][web:101]
     """
     player = item.get("player") or {}
     team = player.get("team") or {}
+
+    # Construire un full_name si absent
+    full_name = player.get("full_name")
+    if not full_name:
+        first = player.get("first_name") or ""
+        last = player.get("last_name") or ""
+        full_name = f"{first} {last}".strip() or None
+
+    team_name = team.get("full_name") or team.get("name")
+
     return {
         "player_id": player.get("id"),
-        "player_name": player.get("full_name"),
+        "player_name": full_name,
         "team_id": team.get("id"),
-        "team_name": team.get("full_name") or team.get("name"),
+        "team_name": team_name,
         "status": item.get("status"),
         "injury": item.get("injury"),
         "description": item.get("description"),
@@ -158,7 +174,7 @@ def injuries_balldontlie(
     }
 
 
-# ---------- BallDontLie : infos joueur par ID ----------
+# ---- Joueur par ID ----
 
 @app.get("/balldontlie/player/{player_id}")
 def balldontlie_player(player_id: int) -> Dict[str, Any]:
@@ -192,7 +208,61 @@ def balldontlie_player(player_id: int) -> Dict[str, Any]:
     }
 
 
-# ---------- BallDontLie : blessures filtrées par player_id ----------
+# ---- Recherche joueurs par nom (BallDontLie) ----
+
+def _search_balldontlie_players(query: str, per_page: int = 25) -> Dict[str, Any]:
+    """
+    Utilise /v1/players?search= pour trouver des joueurs par nom. [web:101][web:139]
+    """
+    params = {"search": query, "per_page": per_page}
+    resp = _call_balldontlie("/v1/players", params=params)
+    return resp
+
+
+@app.get("/players/balldontlie/search")
+def players_balldontlie_search(query: str, per_page: int = 25) -> Dict[str, Any]:
+    """
+    Endpoint exposant la recherche joueurs BallDontLie (utile pour debug / frontend). [web:101][web:139]
+    """
+    raw = _search_balldontlie_players(query=query, per_page=per_page)
+    data = raw.get("data", [])
+    meta = raw.get("meta", {})
+
+    players: List[Dict[str, Any]] = []
+    for p in data:
+        team = p.get("team") or {}
+        full_name = p.get("full_name")
+        if not full_name:
+            first = p.get("first_name") or ""
+            last = p.get("last_name") or ""
+            full_name = f"{first} {last}".strip()
+
+        players.append(
+            {
+                "id": p.get("id"),
+                "full_name": full_name,
+                "first_name": p.get("first_name"),
+                "last_name": p.get("last_name"),
+                "position": p.get("position"),
+                "team": {
+                    "id": team.get("id"),
+                    "name": team.get("full_name") or team.get("name"),
+                    "abbreviation": team.get("abbreviation"),
+                    "city": team.get("city"),
+                },
+            }
+        )
+
+    return {
+        "source": "balldontlie",
+        "query": query,
+        "count": len(players),
+        "meta": meta,
+        "players": players,
+    }
+
+
+# ---- Blessures filtrées par player_id ----
 
 @app.get("/injuries/balldontlie/by-player-id")
 def injuries_balldontlie_by_player_id(
@@ -219,9 +289,11 @@ def injuries_balldontlie_by_player_id(
     }
 
 
-# ---------- ESPN : helpers ----------
+# ============================================================
+#                            ESPN
+# ============================================================
 
-ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"  # page principale des blessures [web:20]
+ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"
 
 
 def _fetch_espn_html() -> str:
@@ -246,39 +318,27 @@ def _fetch_espn_html() -> str:
 def _parse_espn_injuries(html: str) -> List[Dict[str, Any]]:
     """
     Parse les tableaux ESPN (NAME / POS / EST. RETURN DATE / STATUS / COMMENT). [file:2][web:20]
-    On renvoie une liste d'objets simples :
-    - team_name (si détectable plus tard)
-    - player_name
-    - position
-    - est_return_date
-    - status
-    - comment
     """
     soup = BeautifulSoup(html, "html.parser")
 
     results: List[Dict[str, Any]] = []
 
-    # Sur la page ESPN, les tables d'injuries sont rendues dans des balises <table>.
     tables = soup.find_all("table")
     for table in tables:
-        # Récupérer les headers de la table
         headers = [th.get_text(strip=True) for th in table.find_all("th")]
         if not headers:
             continue
 
-        # On cherche les tables avec les colonnes attendues.
         wanted_headers = ["NAME", "POS", "EST. RETURN DATE", "STATUS", "COMMENT"]
         if not all(h in headers for h in wanted_headers):
             continue
 
-        # Indices des colonnes
         idx_name = headers.index("NAME")
         idx_pos = headers.index("POS")
         idx_return = headers.index("EST. RETURN DATE")
         idx_status = headers.index("STATUS")
         idx_comment = headers.index("COMMENT")
 
-        # Parcourir les lignes de joueurs
         for row in table.find_all("tr"):
             cells = row.find_all("td")
             if len(cells) < 5:
@@ -290,8 +350,8 @@ def _parse_espn_injuries(html: str) -> List[Dict[str, Any]]:
             status = cells[idx_status].get_text(strip=True)
             comment = cells[idx_comment].get_text(strip=True)
 
-            if not name or name == "NAME":
-                continue  # ignorer les entêtes répétées
+            if not name or name.upper() == "NAME":
+                continue
 
             results.append(
                 {
@@ -307,13 +367,8 @@ def _parse_espn_injuries(html: str) -> List[Dict[str, Any]]:
     return results
 
 
-# ---------- ESPN : endpoints ----------
-
 @app.get("/espn/raw")
 def espn_raw() -> Dict[str, Any]:
-    """
-    Récupère un snippet HTML de la page ESPN injuries (déjà testé). [web:20]
-    """
     html = _fetch_espn_html()
     return {
         "source": "espn",
@@ -325,9 +380,6 @@ def espn_raw() -> Dict[str, Any]:
 
 @app.get("/injuries/espn")
 def injuries_espn() -> Dict[str, Any]:
-    """
-    Renvoie les blessures ESPN dans un format simplifié, séparé de BallDontLie. [file:2][web:20]
-    """
     html = _fetch_espn_html()
     parsed = _parse_espn_injuries(html)
 
@@ -335,4 +387,98 @@ def injuries_espn() -> Dict[str, Any]:
         "source": "espn",
         "count": len(parsed),
         "injuries": parsed,
+    }
+
+
+# ============================================================
+#                  ENDPOINT MULTI-SOURCES PAR JOUEUR
+# ============================================================
+
+@app.get("/injuries/by-player")
+def injuries_by_player(name: str) -> Dict[str, Any]:
+    """
+    Agrège les infos par joueur sans les fusionner :
+    - BallDontLie : joueur(s) correspondant + blessures associées.
+    - ESPN : lignes d'injuries dont le nom matche. [web:20][web:101]
+    """
+    query = name.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="name parameter must not be empty")
+
+    query_lower = query.lower()
+
+    # 1) ESPN : filtrage simple sur le nom
+    html = _fetch_espn_html()
+    espn_all = _parse_espn_injuries(html)
+    espn_matches = [
+        item
+        for item in espn_all
+        if query_lower in item["player_name"].lower()
+    ]
+
+    # 2) BallDontLie : recherche joueur, puis blessures
+    players_resp = _search_balldontlie_players(query=query, per_page=10)
+    players_data = players_resp.get("data", [])
+
+    # Trouver le meilleur match : d'abord égalité exacte sur le full_name, sinon premier qui contient le nom.
+    bdl_best_player = None
+    query_norm = " ".join(query_lower.split())
+
+    def _normalize_full_name(p: Dict[str, Any]) -> str:
+        full = p.get("full_name")
+        if not full:
+            first = (p.get("first_name") or "").strip()
+            last = (p.get("last_name") or "").strip()
+            full = f"{first} {last}".strip()
+        return " ".join(full.lower().split())
+
+    for p in players_data:
+        full_norm = _normalize_full_name(p)
+        if full_norm == query_norm:
+            bdl_best_player = p
+            break
+
+    if bdl_best_player is None and players_data:
+        bdl_best_player = players_data[0]
+
+    bdl_injuries: List[Dict[str, Any]] = []
+    bdl_player_info: Optional[Dict[str, Any]] = None
+
+    if bdl_best_player is not None:
+        pid = bdl_best_player.get("id")
+
+        # Infos joueur formatées
+        team = bdl_best_player.get("team") or {}
+        full = _normalize_full_name(bdl_best_player)
+        bdl_player_info = {
+            "id": pid,
+            "full_name": full,
+            "first_name": bdl_best_player.get("first_name"),
+            "last_name": bdl_best_player.get("last_name"),
+            "position": bdl_best_player.get("position"),
+            "team": {
+                "id": team.get("id"),
+                "name": team.get("full_name") or team.get("name"),
+                "abbreviation": team.get("abbreviation"),
+                "city": team.get("city"),
+            },
+        }
+
+        # Blessures associées à ce player_id
+        injuries_resp = injuries_balldontlie_by_player_id(player_id=pid, per_page=50)
+        bdl_injuries = injuries_resp.get("injuries", [])
+
+    return {
+        "player_query": query,
+        "sources": {
+            "balldontlie": {
+                "matched_player": bdl_player_info,
+                "raw_search_count": len(players_data),
+                "injuries": bdl_injuries,
+            },
+            "espn": {
+                "injuries": espn_matches,
+                "total_injuries_checked": len(espn_all),
+            },
+        },
     }
