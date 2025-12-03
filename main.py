@@ -122,8 +122,7 @@ def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[st
 
 def _map_balldontlie_injury(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Simplifie un enregistrement injury BallDontLie.
-    Le schéma indique un objet `player` avec les infos de base. [web:43][web:101]
+    Simplifie un enregistrement injury BallDontLie. [web:43][web:101]
     """
     player = item.get("player") or {}
     team = player.get("team") or {}
@@ -253,23 +252,34 @@ def players_balldontlie_search(query: str, per_page: int = 25) -> Dict[str, Any]
     }
 
 
-# ---- Blessures filtrées par player_id ----
+# ---- Blessures filtrées par player_id (filtrage local) ----
 
 @app.get("/injuries/balldontlie/by-player-id")
 def injuries_balldontlie_by_player_id(
     player_id: int,
     per_page: int = 50,
 ) -> Dict[str, Any]:
+    """
+    Renvoie SEULEMENT les blessures BallDontLie pour un joueur donné.
+    On filtre côté backend sur player.id, car le paramètre player_id
+    n'est pas garanti comme filtre serveur. [web:43][web:101]
+    """
     params: Dict[str, Any] = {
         "per_page": per_page,
-        "player_id": player_id,
     }
 
     raw = _call_balldontlie("/v1/player_injuries", params=params)
     raw_data: List[Dict[str, Any]] = raw.get("data", [])
     meta = raw.get("meta", {})
 
-    simplified = [_map_balldontlie_injury(item) for item in raw_data]
+    filtered_raw: List[Dict[str, Any]] = []
+    for item in raw_data:
+        player = item.get("player") or {}
+        pid = player.get("id")
+        if pid == player_id:
+            filtered_raw.append(item)
+
+    simplified = [_map_balldontlie_injury(item) for item in filtered_raw]
 
     return {
         "source": "balldontlie",
@@ -284,7 +294,7 @@ def injuries_balldontlie_by_player_id(
 #                            ESPN
 # ============================================================
 
-ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"
+ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"  # page principale des blessures [web:20]
 
 
 def _fetch_espn_html() -> str:
@@ -422,7 +432,6 @@ def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[D
         resp = _call_balldontlie("/v1/players", params=params)
         data = resp.get("data", [])
 
-        # Ajouter aux résultats cumulés (en évitant les doublons)
         for p in data:
             pid = p.get("id")
             if pid in seen_ids:
@@ -430,7 +439,6 @@ def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[D
             seen_ids.add(pid)
             all_found.append(p)
 
-        # Chercher un match exact sur le nom normalisé
         for p in data:
             if _normalize_full_name(p) == query_norm:
                 best_player = p
@@ -439,7 +447,6 @@ def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[D
         if best_player is not None:
             break
 
-    # Si rien d'exact, prendre le premier trouvé (s'il y en a)
     if best_player is None and all_found:
         best_player = all_found[0]
 
@@ -472,7 +479,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
         if query_lower in item["player_name"].lower()
     ]
 
-    # 2) BallDontLie : meilleure correspondance en essayant nom complet + nom de famille. [web:101][web:139]
+    # 2) BallDontLie : meilleure correspondance nom complet / nom de famille
     best_player, all_players = _search_bdl_best_player(query)
 
     bdl_injuries: List[Dict[str, Any]] = []
