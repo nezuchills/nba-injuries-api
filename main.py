@@ -66,7 +66,7 @@ def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
 def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[str, Any]:
     """
     Renvoie les données brutes de BallDontLie pour les blessures (JSON complet).
-    - Paginate avec cursor / per_page.
+    - Paginate avec cursor / per_page. [web:101]
     """
     api_key = os.getenv("BALLDONTLIE_API_KEY")
     if not api_key:
@@ -104,20 +104,22 @@ def balldontlie_raw(cursor: Optional[int] = None, per_page: int = 25) -> Dict[st
 def _map_balldontlie_injury(item: Dict[str, Any]) -> Dict[str, Any]:
     """
     Transforme un enregistrement brut de BallDontLie en format simplifié.
-    La structure exacte dépend de l’API ; on adapte en fonction des champs présents. [web:101]
+    On part de ce qu’on voit réellement dans ta réponse :
+    - player_id
+    - status
+    - description
+    - return_date
+    etc. [web:101]
     """
-    player = item.get("player", {})  # objet joueur (dépend du schéma BallDontLie) [web:101]
-    team = item.get("team", {})      # objet équipe, si présent [web:101]
-
     return {
-        "player_id": player.get("id"),
-        "player_name": player.get("full_name") or player.get("name"),
-        "team_id": team.get("id"),
-        "team_name": team.get("full_name") or team.get("name"),
-        "status": item.get("status"),           # ex: "out", "questionable" [web:101]
-        "injury": item.get("injury"),           # type de blessure [web:101]
-        "description": item.get("description"), # description longue [web:101]
-        "return_date": item.get("return_date"), # date estimée [web:101]
+        "player_id": item.get("player_id"),
+        "player_name": None,            # sera rempli plus tard via un autre endpoint /players [web:101][web:28]
+        "team_id": None,                # idem
+        "team_name": None,              # idem
+        "status": item.get("status"),   # ex: "Out", "Day-To-Day" [web:101]
+        "injury": item.get("injury"),   # peut être null [web:101]
+        "description": item.get("description"),
+        "return_date": item.get("return_date"),
         "last_update": item.get("updated_at") or item.get("created_at"),
         "source": "balldontlie",
     }
