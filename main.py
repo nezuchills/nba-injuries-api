@@ -715,6 +715,35 @@ def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[D
 #                  ENDPOINT MULTI-SOURCES PAR JOUEUR
 # ============================================================
 
+def _compute_aggregated_status(
+    bdl_injuries: List[Dict[str, Any]],
+    espn_matches: List[Dict[str, Any]],
+    cbs_matches: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Règle simple :
+    - Si BallDontLie, ESPN ou CBS renvoie au moins une entrée -> status = "flagged".
+    - Si les trois sont vides -> status = "clear" (aucune info blessure).
+    """
+    sources_with_info: List[str] = []
+    if bdl_injuries:
+        sources_with_info.append("balldontlie")
+    if espn_matches:
+        sources_with_info.append("espn")
+    if cbs_matches:
+        sources_with_info.append("cbs")
+
+    if not sources_with_info:
+        status = "clear"
+    else:
+        status = "flagged"
+
+    return {
+        "status": status,
+        "sources_with_info": sources_with_info,
+    }
+
+
 @app.get("/injuries/by-player")
 def injuries_by_player(name: str) -> Dict[str, Any]:
     """
@@ -723,6 +752,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
     - ESPN : lignes d'injuries dont le nom matche.
     - NBC : lignes d'injuries.
     - CBS : lignes d'injuries dont le nom matche.
+    + champ aggregated.status pour le ticker (clear / flagged).
     """
     query = name.strip()
     if not query:
@@ -757,8 +787,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
         if query_lower in item["player_name"].lower()
     ]
 
-    # BallDontLie : on garde la casse d'origine pour l'affichage, on utilise
-    # _normalize_full_name seulement pour la comparaison dans _search_bdl_best_player.
+    # BallDontLie
     best_player, all_players = _search_bdl_best_player(query)
 
     bdl_injuries: List[Dict[str, Any]] = []
@@ -791,8 +820,15 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
         injuries_resp = injuries_balldontlie_by_player_id(player_id=pid, per_page=50)
         bdl_injuries = injuries_resp.get("injuries", [])
 
+    aggregated = _compute_aggregated_status(
+        bdl_injuries=bdl_injuries,
+        espn_matches=espn_matches,
+        cbs_matches=cbs_matches,
+    )
+
     return {
         "player_query": query,
+        "aggregated": aggregated,
         "sources": {
             "balldontlie": {
                 "matched_player": bdl_player_info,
@@ -1026,22 +1062,22 @@ def widget() -> str:
       border: 1px solid rgba(148, 163, 184, 0.65);
     }
 
-    .ia-player-photo-wrap {
+    .ia-player-avatar-wrap {
       flex: 0 0 72px;
       height: 72px;
       border-radius: 999px;
       overflow: hidden;
-      background: #0b1220;
+      background: radial-gradient(circle at 30% 0, #38bdf8, #0b1120);
       border: 1px solid rgba(148, 163, 184, 0.8);
       display: flex;
       align-items: center;
       justify-content: center;
     }
 
-    .ia-player-photo {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
+    .ia-player-avatar-initials {
+      font-size: 22px;
+      font-weight: 600;
+      color: #e5f4ff;
     }
 
     .ia-player-info {
@@ -1053,9 +1089,9 @@ def widget() -> str:
 
     .ia-player-name-row {
       display: flex;
-      align-items: baseline;
-      gap: 6px;
-      margin-bottom: 2px;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
     }
 
     .ia-player-name {
@@ -1064,9 +1100,34 @@ def widget() -> str:
       color: #f9fafb;
     }
 
-    .ia-player-age {
-      font-size: 12px;
-      color: #9ca3af;
+    .ia-agg-badge {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .ia-agg-clear {
+      background: rgba(22, 163, 74, 0.18);
+      color: #bbf7d0;
+      border: 1px solid rgba(22, 163, 74, 0.6);
+    }
+
+    .ia-agg-flagged {
+      background: rgba(220, 38, 38, 0.18);
+      color: #fecaca;
+      border: 1px solid rgba(220, 38, 38, 0.6);
+    }
+
+    .ia-agg-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: currentColor;
     }
 
     .ia-player-meta-row {
@@ -1222,13 +1283,13 @@ def widget() -> str:
         <div id="ia-results" class="ia-results" style="display:none;">
 
           <div id="ia-player-card" class="ia-player-card" style="display:none;">
-            <div class="ia-player-photo-wrap">
-              <img id="ia-player-photo" class="ia-player-photo" alt="Player photo" />
+            <div class="ia-player-avatar-wrap">
+              <div id="ia-player-avatar-initials" class="ia-player-avatar-initials"></div>
             </div>
             <div class="ia-player-info">
               <div class="ia-player-name-row">
                 <span id="ia-player-name" class="ia-player-name"></span>
-                <span id="ia-player-age" class="ia-player-age"></span>
+                <span id="ia-player-agg" class="ia-agg-badge" style="display:none;"></span>
               </div>
               <div class="ia-player-meta-row">
                 <img id="ia-team-logo" class="ia-team-logo" alt="Team logo" />
@@ -1298,9 +1359,9 @@ def widget() -> str:
       let suggTimeout = null;
 
       const playerCard = document.getElementById("ia-player-card");
-      const playerPhoto = document.getElementById("ia-player-photo");
+      const playerAvatarInitials = document.getElementById("ia-player-avatar-initials");
       const playerNameEl = document.getElementById("ia-player-name");
-      const playerAgeEl = document.getElementById("ia-player-age");
+      const playerAggEl = document.getElementById("ia-player-agg");
       const teamLogoEl = document.getElementById("ia-team-logo");
       const playerMetaEl = document.getElementById("ia-player-meta");
 
@@ -1401,13 +1462,6 @@ def widget() -> str:
         openSuggestions(filtered);
       }
 
-      function buildHeadshotUrl(firstName, lastName) {
-        if (!firstName || !lastName) return "";
-        const fn = firstName.toLowerCase().replace(/\\s+/g, "_");
-        const ln = lastName.toLowerCase().replace(/\\s+/g, "_");
-        return "https://nba-players.herokuapp.com/players/" + ln + "/" + fn;
-      }
-
       function buildTeamLogoUrl(abbrev) {
         if (!abbrev) return "";
         return (
@@ -1451,7 +1505,41 @@ def widget() -> str:
         }
       }
 
-      function renderPlayerCard(bdlPlayer) {
+      function computeInitials(fullName) {
+        if (!fullName) return "";
+        const parts = fullName.trim().split(/\\s+/);
+        if (parts.length === 1) {
+          return parts[0].charAt(0).toUpperCase();
+        }
+        return (
+          parts[0].charAt(0).toUpperCase() +
+          parts[parts.length - 1].charAt(0).toUpperCase()
+        );
+      }
+
+      function renderAggregatedBadge(aggregated) {
+        if (!aggregated) {
+          playerAggEl.style.display = "none";
+          playerAggEl.textContent = "";
+          playerAggEl.classList.remove("ia-agg-clear", "ia-agg-flagged");
+          return;
+        }
+        const status = aggregated.status || "clear";
+        playerAggEl.classList.remove("ia-agg-clear", "ia-agg-flagged");
+
+        if (status === "clear") {
+          playerAggEl.classList.add("ia-agg-clear");
+          playerAggEl.innerHTML =
+            '<span class="ia-agg-dot"></span><span>OK · Aucune info blessure</span>';
+        } else {
+          playerAggEl.classList.add("ia-agg-flagged");
+          playerAggEl.innerHTML =
+            '<span class="ia-agg-dot"></span><span>ALERTE · Blessé / incertain</span>';
+        }
+        playerAggEl.style.display = "inline-flex";
+      }
+
+      function renderPlayerCard(bdlPlayer, aggregated) {
         if (!bdlPlayer) {
           playerCard.style.display = "none";
           return;
@@ -1460,27 +1548,16 @@ def widget() -> str:
           (bdlPlayer.first_name + " " + bdlPlayer.last_name);
         playerNameEl.textContent = fullName;
 
-        playerAgeEl.textContent = "";
+        const initials = computeInitials(fullName);
+        playerAvatarInitials.textContent = initials || "";
+
+        renderAggregatedBadge(aggregated);
 
         const team = bdlPlayer.team || {};
         const metaParts = [];
         if (team.name) metaParts.push(team.name);
         if (bdlPlayer.position) metaParts.push(bdlPlayer.position);
         playerMetaEl.textContent = metaParts.join(" · ");
-
-        const headshotUrl = buildHeadshotUrl(
-          bdlPlayer.first_name,
-          bdlPlayer.last_name
-        );
-        if (headshotUrl) {
-          playerPhoto.style.display = "block";
-          playerPhoto.src = headshotUrl;
-          playerPhoto.onerror = function () {
-            this.style.display = "none";
-          };
-        } else {
-          playerPhoto.style.display = "none";
-        }
 
         const logoUrl = buildTeamLogoUrl(team.abbreviation);
         if (logoUrl) {
@@ -1500,8 +1577,9 @@ def widget() -> str:
         results.style.display = "block";
         clearSources();
 
+        const aggregated = data.aggregated || null;
         const bdlPlayer = data.sources?.balldontlie?.matched_player || null;
-        renderPlayerCard(bdlPlayer);
+        renderPlayerCard(bdlPlayer, aggregated);
 
         const bdlInj = (data.sources?.balldontlie?.injuries || [])[0];
         if (!bdlInj) {
