@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from typing import Optional, Dict, Any, List, Tuple
 import os
 import requests
-from bs4 import BeautifulSoup  # parser HTML ESPN
+from bs4 import BeautifulSoup  # parser HTML ESPN & NBC
 
 app = FastAPI()
 
@@ -47,7 +47,7 @@ def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
                 "injury": "ankle",
                 "details": "Likely to miss multiple games",
                 "last_update": "2025-12-01T18:40:00Z",
-                "url": "https://www.nbcsports.com/nba/nba/injuries-nbc-sports",
+                "url": "https://www.nbcsports.com/nba/nba-injuries-nbc-sports",
             },
             "balldontlie": {
                 "status": "out",
@@ -260,9 +260,8 @@ def injuries_balldontlie_by_player_id(
     per_page: int = 50,
 ) -> Dict[str, Any]:
     """
-    Renvoie SEULEMENT les blessures BallDontLie pour un joueur donné.
-    On filtre côté backend sur player.id, car le paramètre player_id
-    n'est pas garanti comme filtre serveur. [web:43][web:101]
+    Renvoie SEULEMENT les blessures BallDontLie pour un joueur donné,
+    en filtrant localement sur player.id. [web:43][web:101]
     """
     params: Dict[str, Any] = {
         "per_page": per_page,
@@ -294,7 +293,7 @@ def injuries_balldontlie_by_player_id(
 #                            ESPN
 # ============================================================
 
-ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"  # page principale des blessures [web:20]
+ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"
 
 
 def _fetch_espn_html() -> str:
@@ -392,6 +391,105 @@ def injuries_espn() -> Dict[str, Any]:
 
 
 # ============================================================
+#                            NBC
+# ============================================================
+
+NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba-injuries-nbc-sports"  # page blessures NBC. [web:18]
+
+
+def _fetch_nbc_html() -> str:
+    try:
+        resp = requests.get(
+            NBC_INJURIES_URL,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Error calling NBC: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"NBC error: {resp.text[:200]}",
+        )
+
+    return resp.text
+
+
+def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
+    """
+    Parse les tableaux NBC (PLAYER / POS / DATE / INJURY). [web:18]
+    On renvoie une liste : player_name, position, date, injury.
+    (Les descriptions complètes restent visibles sur le site NBC.)
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    results: List[Dict[str, Any]] = []
+
+    tables = soup.find_all("table")
+    for table in tables:
+        headers = [th.get_text(strip=True).upper() for th in table.find_all("th")]
+        if not headers:
+            continue
+
+        wanted_headers = ["PLAYER", "POS", "DATE", "INJURY"]
+        if not all(h in headers for h in wanted_headers):
+            continue
+
+        idx_name = headers.index("PLAYER")
+        idx_pos = headers.index("POS")
+        idx_date = headers.index("DATE")
+        idx_injury = headers.index("INJURY")
+
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 4:
+                continue
+
+            name = cells[idx_name].get_text(strip=True)
+            pos = cells[idx_pos].get_text(strip=True)
+            date = cells[idx_date].get_text(strip=True)
+            injury = cells[idx_injury].get_text(strip=True)
+
+            if not name or name.upper() == "PLAYER":
+                continue
+
+            results.append(
+                {
+                    "player_name": name,
+                    "position": pos,
+                    "date": date,
+                    "injury": injury,
+                    "source": "nbc",
+                }
+            )
+
+    return results
+
+
+@app.get("/nbc/raw")
+def nbc_raw() -> Dict[str, Any]:
+    html = _fetch_nbc_html()
+    return {
+        "source": "nbc",
+        "url": NBC_INJURIES_URL,
+        "status_code": 200,
+        "content_snippet": html[:500],
+    }
+
+
+@app.get("/injuries/nbc")
+def injuries_nbc() -> Dict[str, Any]:
+    html = _fetch_nbc_html()
+    parsed = _parse_nbc_injuries(html)
+
+    return {
+        "source": "nbc",
+        "count": len(parsed),
+        "injuries": parsed,
+    }
+
+
+# ============================================================
 #           HELPER: meilleure correspondance joueur BDL
 # ============================================================
 
@@ -407,9 +505,9 @@ def _normalize_full_name(p: Dict[str, Any]) -> str:
 def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Essaie plusieurs termes pour trouver le meilleur joueur dans BallDontLie :
-    - d'abord le nom complet
-    - puis le dernier mot (souvent le nom de famille)
-    - puis le premier mot si besoin. [web:101][web:139]
+    - nom complet
+    - dernier mot (souvent le nom de famille)
+    - premier mot si besoin. [web:101][web:139]
     """
     name = name.strip()
     if not name:
@@ -418,9 +516,9 @@ def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[D
     tokens = name.split()
     candidates = [name]
     if len(tokens) >= 1:
-        candidates.append(tokens[-1])  # nom de famille
+        candidates.append(tokens[-1])
     if len(tokens) >= 2:
-        candidates.append(tokens[0])   # prénom
+        candidates.append(tokens[0])
 
     seen_ids = set()
     all_found: List[Dict[str, Any]] = []
@@ -462,7 +560,8 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
     """
     Agrège les infos par joueur sans les fusionner :
     - BallDontLie : joueur correspondant + blessures associées.
-    - ESPN : lignes d'injuries dont le nom matche. [web:20][web:101]
+    - ESPN : lignes d'injuries dont le nom matche.
+    - NBC : lignes d'injuries dont le nom matche. [web:18][web:20][web:101]
     """
     query = name.strip()
     if not query:
@@ -470,16 +569,25 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
 
     query_lower = query.lower()
 
-    # 1) ESPN : filtrage simple sur le nom
-    html = _fetch_espn_html()
-    espn_all = _parse_espn_injuries(html)
+    # ESPN
+    espn_html = _fetch_espn_html()
+    espn_all = _parse_espn_injuries(espn_html)
     espn_matches = [
         item
         for item in espn_all
         if query_lower in item["player_name"].lower()
     ]
 
-    # 2) BallDontLie : meilleure correspondance nom complet / nom de famille
+    # NBC
+    nbc_html = _fetch_nbc_html()
+    nbc_all = _parse_nbc_injuries(nbc_html)
+    nbc_matches = [
+        item
+        for item in nbc_all
+        if query_lower in item["player_name"].lower()
+    ]
+
+    # BallDontLie
     best_player, all_players = _search_bdl_best_player(query)
 
     bdl_injuries: List[Dict[str, Any]] = []
@@ -518,6 +626,10 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
             "espn": {
                 "injuries": espn_matches,
                 "total_injuries_checked": len(espn_all),
+            },
+            "nbc": {
+                "injuries": nbc_matches,
+                "total_injuries_checked": len(nbc_all),
             },
         },
     }
