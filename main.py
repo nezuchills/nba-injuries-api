@@ -287,7 +287,7 @@ ACTIVE_PLAYERS_LOADED: bool = False
 def _load_active_players() -> None:
     """
     Charge tous les joueurs actifs via /v1/players/active (BallDontLie),
-    avec pagination par cursor. [web:20]
+    avec pagination par cursor.
     """
     global ACTIVE_PLAYERS, ACTIVE_PLAYERS_LOADED
     if ACTIVE_PLAYERS_LOADED:
@@ -452,7 +452,7 @@ def injuries_espn() -> Dict[str, Any]:
 #                            NBC
 # ============================================================
 
-NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba/injuries"  # URL actuelle injuries [web:18]
+NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba/injuries"  # URL injuries actuelle [web:18]
 
 
 def _fetch_nbc_html() -> str:
@@ -476,56 +476,91 @@ def _fetch_nbc_html() -> str:
 
 def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
     """
-    Parse la page injuries NBC qui liste, par équipe, un tableau :
-    PLAYER | POS | DATE | INJURY, répété pour Warriors, Bulls, Pelicans, etc. [web:18]
+    Parse la page injuries NBC en texte brut.
+    Schéma dans le contenu :
+    INJURIES -> All teams -> <TEAM> -> PLAYER / POS / DATE / INJURY -> lignes joueur. [web:18]
     """
     soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    lines = [l for l in text.split("\n") if l]
+
     results: List[Dict[str, Any]] = []
 
-    tables = soup.find_all("table")
-    for table in tables:
-        headers = [th.get_text(strip=True).upper() for th in table.find_all("th")]
-        if not headers:
+    try:
+        start_idx = lines.index("INJURIES")
+    except ValueError:
+        # Si on ne trouve pas le bloc injuries, on renvoie vide
+        return results
+
+    header_tokens = {"PLAYER", "POS", "DATE", "INJURY"}
+    positions = {
+        "PG", "SG", "SF", "PF", "C",
+        "G", "F",
+        "G-F", "F-G", "G/F", "F/C", "C/F"
+    }
+
+    i = start_idx
+    current_team: Optional[str] = None
+
+    def looks_like_header(idx: int) -> bool:
+        if idx + 4 >= len(lines):
+            return False
+        return (
+            lines[idx] not in header_tokens
+            and lines[idx + 1] == "PLAYER"
+            and lines[idx + 2] == "POS"
+            and lines[idx + 3] == "DATE"
+            and lines[idx + 4] == "INJURY"
+        )
+
+    while i < len(lines) - 5:
+        # Détection d'un nouveau bloc équipe
+        if looks_like_header(i):
+            current_team = lines[i]
+            i += 5  # on saute TEAM + PLAYER POS DATE INJURY
             continue
 
-        wanted_headers = ["PLAYER", "POS", "DATE", "INJURY"]
-        if not all(h in headers for h in wanted_headers):
+        if current_team is None:
+            i += 1
             continue
 
-        idx_name = headers.index("PLAYER")
-        idx_pos = headers.index("POS")
-        idx_date = headers.index("DATE")
-        idx_injury = headers.index("INJURY")
+        # On essaye de récupérer un bloc joueur : name, pos, date, injury, description
+        if i + 4 >= len(lines):
+            break
 
-        # Tente de remonter le nom d'équipe via le heading précédent (Warriors, Bulls, etc.).
-        team_name = None
-        heading = table.find_previous(["h2", "h3", "h4", "h5"])
-        if heading:
-            team_name = heading.get_text(strip=True)
+        name = lines[i].strip()
+        pos = lines[i + 1].strip()
+        date = lines[i + 2].strip()
+        injury = lines[i + 3].strip()
+        desc = lines[i + 4].strip()
 
-        for row in table.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) < 4:
-                continue
+        # Si on retombe sur un header ou sur un truc qui ressemble pas à un joueur, on avance
+        if (
+            name in header_tokens
+            or pos in header_tokens
+            or date in header_tokens
+            or injury in header_tokens
+        ):
+            i += 1
+            continue
 
-            name = cells[idx_name].get_text(strip=True)
-            pos = cells[idx_pos].get_text(strip=True)
-            date = cells[idx_date].get_text(strip=True)
-            injury_text = cells[idx_injury].get_text(" ", strip=True)
+        # Filtre très basique sur la position pour éviter de parser n'importe quoi
+        if pos not in positions:
+            i += 1
+            continue
 
-            if not name or name.upper() == "PLAYER":
-                continue
-
-            results.append(
-                {
-                    "player_name": name,
-                    "position": pos,
-                    "date": date,
-                    "injury": injury_text,
-                    "team": team_name,
-                    "source": "nbc",
-                }
-            )
+        results.append(
+            {
+                "player_name": name,
+                "position": pos,
+                "date": date,
+                "injury": injury,
+                "description": desc,
+                "team": current_team,
+                "source": "nbc",
+            }
+        )
+        i += 5
 
     return results
 
@@ -645,7 +680,7 @@ def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
 
 
 @app.get("/cbs/raw")
-def cbs_raw() -> Dict[str, Any]:
+def cbs_raw():
     html = _fetch_cbs_html()
     return {
         "source": "cbs",
@@ -656,7 +691,7 @@ def cbs_raw() -> Dict[str, Any]:
 
 
 @app.get("/injuries/cbs")
-def injuries_cbs() -> Dict[str, Any]:
+def injuries_cbs():
     html = _fetch_cbs_html()
     parsed = _parse_cbs_injuries(html)
 
@@ -736,7 +771,7 @@ def _compute_aggregated_status(
     """
     Règle simple :
     - Si BallDontLie, ESPN, CBS ou NBC renvoie au moins une entrée -> status = "flagged".
-    - Si les quatre sont vides -> status = "clear".
+    - Sinon -> "clear".
     """
     sources_with_info: List[str] = []
     if bdl_injuries:
@@ -764,7 +799,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
     - ESPN : lignes d'injuries dont le nom matche.
     - NBC : lignes d'injuries dont le nom matche.
     - CBS : lignes d'injuries dont le nom matche.
-    + champ aggregated.status pour le ticker (clear / flagged).
+    + champ aggregated.status pour le ticker.
     """
     query = name.strip()
     if not query:
@@ -871,8 +906,8 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
 @app.get("/widget", response_class=HTMLResponse)
 def widget() -> str:
     """
-    Petite page HTML autonome (dark, auto-complétion via cache,
-    tuiles + statut agrégé, bouton de réveil Render + bouton de reset).
+    Widget HTML autonome (dark, auto-complétion via cache,
+    statut agrégé, bouton de réveil + reset).
     """
     _load_active_players()
     players_json = json.dumps(ACTIVE_PLAYERS)
@@ -1289,20 +1324,6 @@ def widget() -> str:
       color: #9ca3af;
     }}
 
-    .ia-note {{
-      font-size: 12px;
-      color: #9ca3af;
-    }}
-
-    .ia-note a {{
-      color: #60a5fa;
-      text-decoration: none;
-    }}
-
-    .ia-note a:hover {{
-      text-decoration: underline;
-    }}
-
     .ia-status {{
       font-weight: 500;
     }}
@@ -1321,7 +1342,6 @@ def widget() -> str:
     }}
   </style>
   <script>
-    // Liste des joueurs actifs injectée côté backend (aucune requête réseau pour l'auto-complétion).
     window.__ACTIVE_PLAYERS__ = {players_json};
   </script>
 </head>
@@ -1421,7 +1441,6 @@ def widget() -> str:
 
   <script>
     (function () {{
-      // liste injectée côté backend
       let ACTIVE_PLAYERS = window.__ACTIVE_PLAYERS__ || [];
       let ACTIVE_PLAYERS_LOADED = ACTIVE_PLAYERS.length > 0;
 
