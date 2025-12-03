@@ -1421,18 +1421,46 @@ def widget() -> str:
       const playerMetaEl = document.getElementById("ia-player-meta");
 
       async function wakeService() {{
+        // Empêche plusieurs clics simultanés, mais permet de réutiliser le bouton plus tard
         wakeBtn.disabled = true;
-        wakeStatus.textContent = "Réveil en cours… cela peut prendre quelques secondes si le service dormait.";
+        const prevSearchDisabled = button.disabled;
+        button.disabled = true; // on bloque aussi la recherche pendant le réveil
+        wakeStatus.textContent = "Réveil en cours… cela peut prendre jusqu'à une minute si le service dormait.";
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s de marge
+
         try {{
-          const res = await fetch("/health", {{ method: "GET" }});
+          const res = await fetch("/health", {{ method: "GET", signal: controller.signal }});
+          clearTimeout(timeoutId);
+
           if (!res.ok) {{
             throw new Error("Health error " + res.status);
           }}
+
           wakeStatus.textContent = "Service réveillé. Tu peux lancer une recherche.";
         }} catch (e) {{
           console.error(e);
-          wakeStatus.textContent = "Impossible de réveiller le service (réessaie ou rafraîchis la page).";
+          if (e.name === "AbortError") {{
+            wakeStatus.textContent = "Temps dépassé pour le réveil du service. Réessaie ou rafraîchis la page.";
+          }} else {{
+            wakeStatus.textContent = "Impossible de réveiller le service (réessaie ou rafraîchis la page).";
+          }}
+        }} finally {{
+          // On réactive toujours les boutons pour pouvoir réutiliser le bouton de réveil plus tard
           wakeBtn.disabled = false;
+          button.disabled = prevSearchDisabled;
+
+          // Optionnel : au bout de 30s, on remet le message par défaut
+          setTimeout(() => {{
+            if (
+              wakeStatus.textContent.startsWith("Service réveillé") ||
+              wakeStatus.textContent.startsWith("Temps dépassé") ||
+              wakeStatus.textContent.startsWith("Impossible de réveiller")
+            ) {{
+              wakeStatus.textContent = "Utilise ce bouton si la première recherche semble lente.";
+            }}
+          }}, 30000);
         }}
       }}
 
@@ -1686,7 +1714,6 @@ def widget() -> str:
       }}
 
       wakeBtn.addEventListener("click", wakeService);
-
       button.addEventListener("click", searchPlayer);
 
       input.addEventListener("keydown", function (e) {{
