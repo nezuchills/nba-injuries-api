@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup  # parser HTML (ESPN, NBC, CBS)
 
 app = FastAPI()
 
-# CORS : utile si tu appelles l’API depuis ailleurs, mais pour /widget (même origine) ce n’est plus critique.
+# CORS : autorise les appels extérieurs (utile si tu veux d'autres frontends plus tard).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -272,6 +272,80 @@ def injuries_balldontlie_by_player_id(
         "count": len(simplified),
         "meta": meta,
         "injuries": simplified,
+    }
+
+
+# ============================================================
+#               CACHE DES JOUEURS ACTIFS (AUTO-COMPLETE)
+# ============================================================
+
+ACTIVE_PLAYERS: List[Dict[str, Any]] = []
+ACTIVE_PLAYERS_LOADED: bool = False
+
+
+def _load_active_players() -> None:
+    """
+    Charge tous les joueurs actifs via /v1/players/active (BallDontLie),
+    avec pagination par cursor. Appelé une seule fois, puis mis en cache. [web:101][web:27]
+    """
+    global ACTIVE_PLAYERS, ACTIVE_PLAYERS_LOADED
+    if ACTIVE_PLAYERS_LOADED:
+        return
+
+    players: List[Dict[str, Any]] = []
+    cursor: Optional[int] = None
+
+    while True:
+        params: Dict[str, Any] = {"per_page": 100}
+        if cursor is not None:
+            params["cursor"] = cursor
+
+        resp = _call_balldontlie("/v1/players/active", params=params)
+        data = resp.get("data", [])
+        meta = resp.get("meta", {}) or {}
+
+        for p in data:
+            team = p.get("team") or {}
+            full_name = p.get("full_name")
+            if not full_name:
+                first = p.get("first_name") or ""
+                last = p.get("last_name") or ""
+                full_name = f"{first} {last}".strip()
+
+            players.append(
+                {
+                    "id": p.get("id"),
+                    "full_name": full_name,
+                    "first_name": p.get("first_name"),
+                    "last_name": p.get("last_name"),
+                    "position": p.get("position"),
+                    "team": {
+                        "id": team.get("id"),
+                        "name": team.get("full_name") or team.get("name"),
+                        "abbreviation": team.get("abbreviation"),
+                        "city": team.get("city"),
+                    },
+                }
+            )
+
+        cursor = meta.get("next_cursor")
+        if not cursor:
+            break
+
+    ACTIVE_PLAYERS = players
+    ACTIVE_PLAYERS_LOADED = True
+
+
+@app.get("/players/active/local")
+def players_active_local() -> Dict[str, Any]:
+    """
+    Retourne la liste en cache des joueurs actifs (pour auto-complétion).
+    """
+    _load_active_players()
+    return {
+        "source": "balldontlie",
+        "count": len(ACTIVE_PLAYERS),
+        "players": ACTIVE_PLAYERS,
     }
 
 
@@ -643,6 +717,13 @@ def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[D
 
 @app.get("/injuries/by-player")
 def injuries_by_player(name: str) -> Dict[str, Any]:
+    """
+    Agrège les infos par joueur sans les fusionner :
+    - BallDontLie : joueur correspondant + blessures associées.
+    - ESPN : lignes d'injuries dont le nom matche.
+    - NBC : lignes d'injuries.
+    - CBS : lignes d'injuries dont le nom matche.
+    """
     query = name.strip()
     if not query:
         raise HTTPException(status_code=400, detail="name parameter must not be empty")
@@ -676,7 +757,8 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
         if query_lower in item["player_name"].lower()
     ]
 
-    # BallDontLie
+    # BallDontLie : on garde la casse d'origine pour l'affichage, on utilise
+    # _normalize_full_name seulement pour la comparaison dans _search_bdl_best_player.
     best_player, all_players = _search_bdl_best_player(query)
 
     bdl_injuries: List[Dict[str, Any]] = []
@@ -685,11 +767,16 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
     if best_player is not None:
         pid = best_player.get("id")
         team = best_player.get("team") or {}
-        full = _normalize_full_name(best_player)
+
+        full_name = best_player.get("full_name")
+        if not full_name:
+            first = (best_player.get("first_name") or "").strip()
+            last = (best_player.get("last_name") or "").strip()
+            full_name = f"{first} {last}".strip()
 
         bdl_player_info = {
             "id": pid,
-            "full_name": full,
+            "full_name": full_name,
             "first_name": best_player.get("first_name"),
             "last_name": best_player.get("last_name"),
             "position": best_player.get("position"),
@@ -735,15 +822,15 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
 @app.get("/widget", response_class=HTMLResponse)
 def widget() -> str:
     """
-    Petite page HTML autonome (dark, auto-complétion, tuiles) qui consomme
-    directement les endpoints de cette API. À embed dans Carrd via iframe.
+    Petite page HTML autonome (dark, auto-complétion rapide via cache, tuiles)
+    qui consomme directement les endpoints de cette API. À embed dans Carrd via iframe.
     """
     return """
 <!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
-  <title>NBA Injuries Radar</title>
+  <title>NBA Injury Checker</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body {
@@ -791,12 +878,13 @@ def widget() -> str:
 
     .ia-title {
       position: relative;
-      margin: 0 0 4px;
+      margin: 0 0 6px;
       font-size: 26px;
       font-weight: 650;
       letter-spacing: 0.06em;
       text-transform: uppercase;
       color: #f9fafb;
+      text-align: center;
     }
 
     .ia-subtitle {
@@ -804,6 +892,7 @@ def widget() -> str:
       margin: 0 0 18px;
       font-size: 13px;
       color: #9ca3af;
+      text-align: center;
     }
 
     .ia-search {
@@ -860,6 +949,12 @@ def widget() -> str:
 
     #ia-search-btn:hover:not(:disabled) {
       background: linear-gradient(to right, #1d4ed8, #4338ca);
+    }
+
+    .ia-hint {
+      margin: 4px 0 8px;
+      font-size: 11px;
+      color: #9ca3af;
     }
 
     .ia-suggestions {
@@ -1097,9 +1192,9 @@ def widget() -> str:
   <div id="injury-app">
     <div class="ia-shell">
       <div class="ia-card">
-        <h1 class="ia-title">NBA Injuries Radar</h1>
+        <h1 class="ia-title">NBA Injury Checker</h1>
         <p class="ia-subtitle">
-          Recherche un joueur NBA pour comparer les infos BallDontLie, ESPN et CBS.
+          Agrégateur d'informations sur le statut des joueurs NBA.
         </p>
 
         <div class="ia-search">
@@ -1107,12 +1202,16 @@ def widget() -> str:
             <input
               id="ia-player-input"
               type="text"
-              placeholder="Rechercher un joueur (ex : Kristaps Porzingis)"
+              placeholder="Rechercher un joueur (min. 3 caractères, ex : Kristaps Porzingis)"
               autocomplete="off"
             />
             <div id="ia-suggestions" class="ia-suggestions" style="display:none;"></div>
           </div>
           <button id="ia-search-btn">Chercher</button>
+        </div>
+
+        <div class="ia-hint">
+          Tape au moins 3 caractères pour voir les suggestions, puis valide avec Entrée ou clique sur Chercher.
         </div>
 
         <div id="ia-loader" class="ia-loader" style="display:none;">
@@ -1182,6 +1281,9 @@ def widget() -> str:
 
   <script>
     (function () {
+      let ACTIVE_PLAYERS = [];
+      let ACTIVE_PLAYERS_LOADED = false;
+
       const input = document.getElementById("ia-player-input");
       const button = document.getElementById("ia-search-btn");
       const loader = document.getElementById("ia-loader");
@@ -1268,22 +1370,35 @@ def widget() -> str:
         suggBox.style.display = "block";
       }
 
-      async function fetchSuggestions(q) {
+      async function ensureActivePlayersLoaded() {
+        if (ACTIVE_PLAYERS_LOADED) return;
+        try {
+          const res = await fetch("/players/active/local", { method: "GET" });
+          if (!res.ok) throw new Error("Active players error " + res.status);
+          const data = await res.json();
+          ACTIVE_PLAYERS = data.players || [];
+          ACTIVE_PLAYERS_LOADED = true;
+        } catch (e) {
+          console.error("Erreur chargement joueurs actifs", e);
+        }
+      }
+
+      async function fetchSuggestionsLocal(q) {
         if (q.length < 3) {
           closeSuggestions();
           return;
         }
-        try {
-          const url =
-            "/players/balldontlie/search?query=" +
-            encodeURIComponent(q);
-          const res = await fetch(url, { method: "GET" });
-          if (!res.ok) return;
-          const data = await res.json();
-          openSuggestions(data.players || []);
-        } catch (e) {
-          console.error("Erreur suggestions", e);
+        await ensureActivePlayersLoaded();
+        if (!ACTIVE_PLAYERS.length) {
+          closeSuggestions();
+          return;
         }
+        const qLower = q.toLowerCase();
+        const filtered = ACTIVE_PLAYERS.filter(function (p) {
+          const fn = p.full_name || (p.first_name + " " + p.last_name);
+          return fn.toLowerCase().includes(qLower);
+        });
+        openSuggestions(filtered);
       }
 
       function buildHeadshotUrl(firstName, lastName) {
@@ -1452,8 +1567,8 @@ def widget() -> str:
           clearTimeout(suggTimeout);
         }
         suggTimeout = setTimeout(function () {
-          fetchSuggestions(q);
-        }, 220);
+          fetchSuggestionsLocal(q);
+        }, 150);
       });
 
       document.addEventListener("click", function (e) {
