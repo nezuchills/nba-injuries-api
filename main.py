@@ -411,8 +411,7 @@ def _fetch_nbc_html() -> str:
 def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
     """
     Tentative de parsing NBC. Pour l'instant, la page ne contient pas
-    de tableau HTML statique exploitable dans l'HTML brut, donc
-    ce parser renverra souvent une liste vide.
+    de tableau HTML statique exploitable dans l'HTML brut.
     """
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
@@ -507,9 +506,31 @@ def _fetch_cbs_html() -> str:
     return resp.text
 
 
+def _clean_cbs_player_name(raw: str) -> str:
+    """
+    CBS concatène abréviation + nom complet : ex. 'K. PorzingisKristaps Porzingis'.
+    On cherche la première transition 'minuscule' -> 'majuscule' sans espace
+    et on garde la partie droite comme nom complet. [web:6][file:1]
+    """
+    s = raw.strip()
+    split_idx = None
+    for i in range(1, len(s)):
+        if s[i - 1].islower() and s[i].isupper():
+            split_idx = i
+            break
+
+    if split_idx is not None:
+        full = s[split_idx:].strip()
+        if full:
+            return full
+
+    return s
+
+
 def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
     """
-    Parse les tableaux CBS (Player / Position / Updated / Injury / Injury Status). [web:6]
+    Parse les tableaux CBS (Player / Position / Updated / Injury / Injury Status),
+    en nettoyant player_name pour ne garder que le nom complet. [web:6][file:1]
     """
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
@@ -535,7 +556,8 @@ def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
             if len(cells) < 5:
                 continue
 
-            name = cells[idx_name].get_text(strip=True)
+            raw_name = cells[idx_name].get_text(strip=True)
+            name = _clean_cbs_player_name(raw_name)
             pos = cells[idx_pos].get_text(strip=True)
             updated = cells[idx_updated].get_text(strip=True)
             injury = cells[idx_injury].get_text(strip=True)
@@ -596,7 +618,8 @@ def _normalize_full_name(p: Dict[str, Any]) -> str:
 
 def _search_bdl_best_player(name: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Essaie nom complet, nom de famille, puis prénom pour trouver le meilleur joueur BallDontLie. [web:101][web:139]
+    Essaie nom complet, nom de famille, puis prénom pour trouver le meilleur
+    joueur BallDontLie.
     """
     name = name.strip()
     if not name:
@@ -651,7 +674,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
     - BallDontLie : joueur correspondant + blessures associées.
     - ESPN : lignes d'injuries dont le nom matche.
     - NBC : lignes d'injuries (souvent vide pour l’instant).
-    - CBS : lignes d'injuries dont le nom matche. [web:6][web:20][web:101]
+    - CBS : lignes d'injuries dont le nom matche.
     """
     query = name.strip()
     if not query:
