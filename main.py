@@ -59,7 +59,7 @@ def injuries_test(player: Optional[str] = None) -> Dict[str, Any]:
                 "injury": "ankle",
                 "details": "Likely to miss multiple games",
                 "last_update": "2025-12-01T18:40:00Z",
-                "url": "https://www.nbcsports.com/nba/nba-injuries-nbc-sports",
+                "url": "https://www.nbcsports.com/nba/nba/injuries",
             },
             "balldontlie": {
                 "status": "out",
@@ -287,7 +287,7 @@ ACTIVE_PLAYERS_LOADED: bool = False
 def _load_active_players() -> None:
     """
     Charge tous les joueurs actifs via /v1/players/active (BallDontLie),
-    avec pagination par cursor. Appelé une seule fois, puis mis en cache. [web:101][web:27]
+    avec pagination par cursor. [web:20]
     """
     global ACTIVE_PLAYERS, ACTIVE_PLAYERS_LOADED
     if ACTIVE_PLAYERS_LOADED:
@@ -341,7 +341,6 @@ def _load_active_players() -> None:
 def players_active_local() -> Dict[str, Any]:
     """
     Retourne la liste en cache des joueurs actifs (pour auto-complétion).
-    Toujours disponible pour d'autres clients, même si le widget injecte déjà cette liste.
     """
     _load_active_players()
     return {
@@ -453,7 +452,7 @@ def injuries_espn() -> Dict[str, Any]:
 #                            NBC
 # ============================================================
 
-NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba-injuries-nbc-sports"
+NBC_INJURIES_URL = "https://www.nbcsports.com/nba/nba/injuries"  # URL actuelle injuries [web:18]
 
 
 def _fetch_nbc_html() -> str:
@@ -476,6 +475,10 @@ def _fetch_nbc_html() -> str:
 
 
 def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
+    """
+    Parse la page injuries NBC qui liste, par équipe, un tableau :
+    PLAYER | POS | DATE | INJURY, répété pour Warriors, Bulls, Pelicans, etc. [web:18]
+    """
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
 
@@ -494,6 +497,12 @@ def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
         idx_date = headers.index("DATE")
         idx_injury = headers.index("INJURY")
 
+        # Tente de remonter le nom d'équipe via le heading précédent (Warriors, Bulls, etc.).
+        team_name = None
+        heading = table.find_previous(["h2", "h3", "h4", "h5"])
+        if heading:
+            team_name = heading.get_text(strip=True)
+
         for row in table.find_all("tr"):
             cells = row.find_all("td")
             if len(cells) < 4:
@@ -502,7 +511,7 @@ def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
             name = cells[idx_name].get_text(strip=True)
             pos = cells[idx_pos].get_text(strip=True)
             date = cells[idx_date].get_text(strip=True)
-            injury = cells[idx_injury].get_text(strip=True)
+            injury_text = cells[idx_injury].get_text(" ", strip=True)
 
             if not name or name.upper() == "PLAYER":
                 continue
@@ -512,7 +521,8 @@ def _parse_nbc_injuries(html: str) -> List[Dict[str, Any]]:
                     "player_name": name,
                     "position": pos,
                     "date": date,
-                    "injury": injury,
+                    "injury": injury_text,
+                    "team": team_name,
                     "source": "nbc",
                 }
             )
@@ -721,11 +731,12 @@ def _compute_aggregated_status(
     bdl_injuries: List[Dict[str, Any]],
     espn_matches: List[Dict[str, Any]],
     cbs_matches: List[Dict[str, Any]],
+    nbc_matches: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
     Règle simple :
-    - Si BallDontLie, ESPN ou CBS renvoie au moins une entrée -> status = "flagged".
-    - Si les trois sont vides -> status = "clear" (aucune info blessure).
+    - Si BallDontLie, ESPN, CBS ou NBC renvoie au moins une entrée -> status = "flagged".
+    - Si les quatre sont vides -> status = "clear".
     """
     sources_with_info: List[str] = []
     if bdl_injuries:
@@ -734,11 +745,10 @@ def _compute_aggregated_status(
         sources_with_info.append("espn")
     if cbs_matches:
         sources_with_info.append("cbs")
+    if nbc_matches:
+        sources_with_info.append("nbc")
 
-    if not sources_with_info:
-        status = "clear"
-    else:
-        status = "flagged"
+    status = "flagged" if sources_with_info else "clear"
 
     return {
         "status": status,
@@ -826,6 +836,7 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
         bdl_injuries=bdl_injuries,
         espn_matches=espn_matches,
         cbs_matches=cbs_matches,
+        nbc_matches=nbc_matches,
     )
 
     return {
@@ -860,10 +871,8 @@ def injuries_by_player(name: str) -> Dict[str, Any]:
 @app.get("/widget", response_class=HTMLResponse)
 def widget() -> str:
     """
-    Petite page HTML autonome (dark, auto-complétion rapide via cache,
+    Petite page HTML autonome (dark, auto-complétion via cache,
     tuiles + statut agrégé, bouton de réveil Render + bouton de reset).
-    Les joueurs actifs sont injectés directement dans la page pour éviter
-    tout appel réseau pour l'auto-complétion.
     """
     _load_active_players()
     players_json = json.dumps(ACTIVE_PLAYERS)
@@ -1396,16 +1405,9 @@ def widget() -> str:
             </div>
             <div class="ia-col" id="ia-src-nbc">
               <div class="ia-col-header">
-                <span class="ia-col-label">NBC (manuel)</span>
+                <span class="ia-col-label">NBC</span>
               </div>
-              <div class="ia-col-body">
-                <p class="ia-note">
-                  NBC est chargé dynamiquement. Vérifie directement&nbsp;:
-                  <a href="https://www.nbcsports.com/nba/nba-injuries-nbc-sports" target="_blank" rel="noopener">
-                    NBC Injuries
-                  </a>
-                </p>
-              </div>
+              <div class="ia-col-body"></div>
             </div>
           </div>
         </div>
@@ -1436,6 +1438,7 @@ def widget() -> str:
       const srcBdl = document.querySelector("#ia-src-bdl .ia-col-body");
       const srcEspn = document.querySelector("#ia-src-espn .ia-col-body");
       const srcCbs = document.querySelector("#ia-src-cbs .ia-col-body");
+      const srcNbc = document.querySelector("#ia-src-nbc .ia-col-body");
 
       const suggBox = document.getElementById("ia-suggestions");
       let suggTimeout = null;
@@ -1448,14 +1451,13 @@ def widget() -> str:
       const playerMetaEl = document.getElementById("ia-player-meta");
 
       async function wakeService() {{
-        // Empêche plusieurs clics simultanés, mais permet de réutiliser le bouton plus tard
         wakeBtn.disabled = true;
         const prevSearchDisabled = searchBtn.disabled;
-        searchBtn.disabled = true; // on bloque aussi la recherche pendant le réveil
+        searchBtn.disabled = true;
         wakeStatus.textContent = "Réveil en cours… cela peut prendre jusqu'à une minute si le service dormait.";
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s de marge
+        const timeoutId = setTimeout(() => controller.abort(), 60000);
 
         try {{
           const res = await fetch("/health", {{ method: "GET", signal: controller.signal }});
@@ -1474,11 +1476,9 @@ def widget() -> str:
             wakeStatus.textContent = "Impossible de réveiller le service (réessaie ou rafraîchis la page).";
           }}
         }} finally {{
-          // On réactive toujours les boutons pour pouvoir réutiliser le bouton de réveil plus tard
           wakeBtn.disabled = false;
           searchBtn.disabled = prevSearchDisabled;
 
-          // Optionnel : au bout de 30s, on remet le message par défaut
           setTimeout(() => {{
             if (
               wakeStatus.textContent.startsWith("Service réveillé") ||
@@ -1510,6 +1510,7 @@ def widget() -> str:
         srcBdl.innerHTML = "";
         srcEspn.innerHTML = "";
         srcCbs.innerHTML = "";
+        srcNbc.innerHTML = "";
       }}
 
       function renderEmpty(el) {{
@@ -1736,6 +1737,21 @@ def widget() -> str:
             '<p class="ia-meta">' +
             (cbsInj.injury || "Injury non précisée") +
             (cbsInj.updated ? " · maj " + cbsInj.updated : "") +
+            "</p>";
+        }}
+
+        const nbcInj = (data.sources?.nbc?.injuries || [])[0];
+        if (!nbcInj) {{
+          renderEmpty(srcNbc);
+        }} else {{
+          const team = nbcInj.team || "";
+          const date = nbcInj.date || "";
+          srcNbc.innerHTML =
+            '<p class="ia-status">NBC injury report</p>' +
+            '<p class="ia-meta">' +
+            (nbcInj.injury || "Injury non précisée") +
+            (date ? " · " + date : "") +
+            (team ? " · " + team : "") +
             "</p>";
         }}
       }}
