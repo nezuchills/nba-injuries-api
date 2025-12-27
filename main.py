@@ -333,16 +333,11 @@ def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-#                      NBC (Rotoworld/NBC)
+#                      NBC (faux positifs FIX)
 # ============================================================
 
-# Feed fantasy (souvent bruité / pas toujours le joueur) [web:14]
 NBC_FANTASY_PLAYER_NEWS_URL = "https://www.nbcsports.com/fantasy/basketball/player-news"
-
-# Page NBA Player News (non-fantasy) [web:383]
 NBC_NBA_PLAYER_NEWS_URL = "https://www.nbcsports.com/nba/nba/player-news"
-
-# Pages "Team player news" (format /nba/{team-slug}/player-news) [web:395]
 NBC_TEAM_PLAYER_NEWS_TEMPLATE = "https://www.nbcsports.com/nba/{team_slug}/player-news"
 
 TEAM_SLUG_BY_ABBR = {
@@ -378,21 +373,59 @@ TEAM_SLUG_BY_ABBR = {
     "WAS": "washington-wizards",
 }
 
+TEAM_ABBRS = set(TEAM_SLUG_BY_ABBR.keys())
+
 
 def _fetch_nbc_html(url: str) -> str:
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error calling NBC: {e}")
-
-    if resp.status_code != 200:
-        # On ne raise pas systématiquement ici, car on essaye plusieurs URLs
+    except requests.RequestException:
         return ""
-
+    if resp.status_code != 200:
+        return ""
     return resp.text
 
 
-def _extract_nbc_matches_from_html(html: str, player_full_name: str, max_items: int = 2) -> List[Dict[str, Any]]:
+def _parse_nbc_player_header_from_tokens(tokens: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    tokens exemple: ["Injury","Anthony","Edwards","MIN","Guard"] ou ["Paolo","Banchero","ORL","Forward"]
+    -> (full_name, team_abbr, position)
+    """
+    if not tokens:
+        return None, None, None
+
+    # retire préfixes éventuels
+    while tokens and tokens[0].lower() in {"injury", "recap", "transaction", "headline"}:
+        tokens = tokens[1:]
+
+    # trouve team abbr
+    team_idx = None
+    for i, t in enumerate(tokens):
+        if t.upper() in TEAM_ABBRS:
+            team_idx = i
+            break
+
+    if team_idx is None or team_idx == 0:
+        return None, None, None
+
+    name_tokens = tokens[:team_idx]
+    team_abbr = tokens[team_idx].upper()
+    position = None
+    if team_idx + 1 < len(tokens):
+        position = tokens[team_idx + 1]
+
+    full_name = " ".join(name_tokens).strip()
+    if not full_name:
+        return None, None, None
+
+    return full_name, team_abbr, position
+
+
+def _extract_nbc_matches_from_html(html: str, target_full_name: str, max_items: int = 2) -> List[Dict[str, Any]]:
+    """
+    FIX: on ne matche plus "target_full_name apparaît dans le texte".
+    On matche uniquement si l'entête joueur de l'article == target_full_name.
+    """
     if not html:
         return []
 
@@ -400,75 +433,82 @@ def _extract_nbc_matches_from_html(html: str, player_full_name: str, max_items: 
     text = soup.get_text("\n", strip=True)
     lines = [l for l in text.split("\n") if l.strip()]
 
-    norm_query = _normalize_str(player_full_name)
-    results: List[Dict[str, Any]] = []
+    target_norm = _normalize_str(target_full_name)
+    matches: List[Dict[str, Any]] = []
 
-    # Limite après un header si présent (mais on reste robuste)
-    start_idx = 0
+    # On repère les lignes contenant "Link copied to clipboard"
     for idx, line in enumerate(lines):
-        if _normalize_str(line) in {_normalize_str("NBA Player News"), _normalize_str("Player News")}:
-            start_idx = idx
+        nline = _normalize_str(line)
+        if "link copied to clipboard" not in nline:
+            continue
+
+        # Cas 1: la ligne contient déjà "Injury ... Name TEAM Pos"
+        remainder = re.sub(r"(?i).*link copied to clipboard!?", "", line).strip()
+        tokens = remainder.split()
+
+        # Cas 2: sinon, on prend quelques lignes suivantes (souvent prénom/nom/team/pos séparés)
+        if not tokens:
+            lookahead = []
+            for j in range(idx + 1, min(idx + 8, len(lines))):
+                if "link copied to clipboard" in _normalize_str(lines[j]):
+                    break
+                lookahead.append(lines[j])
+            tokens = " ".join(lookahead).split()
+
+        header_name, header_abbr, header_pos = _parse_nbc_player_header_from_tokens(tokens)
+        if not header_name:
+            continue
+
+        if _normalize_str(header_name) != target_norm:
+            # IMPORTANT: pas de faux positif (Franz mentionné dans un article de Paolo)
+            continue
+
+        # summary: on prend les 8 lignes précédentes (pour éviter de renvoyer un pavé)
+        prev = lines[max(0, idx - 10):idx]
+        summary_text = " ".join(prev).strip()
+        summary_text = re.sub(r"\s+", " ", summary_text).strip()
+        if len(summary_text) > 450:
+            summary_text = summary_text[-450:]
+
+        matches.append(
+            {
+                "headline": f"{header_name} {header_abbr} {header_pos or ''}".strip(),
+                "summary": summary_text,
+                "player_header_name": header_name,
+                "player_header_team": header_abbr,
+                "player_header_position": header_pos,
+            }
+        )
+
+        if len(matches) >= max_items:
             break
 
-    i = start_idx
-    while i < len(lines) and len(results) < max_items:
-        if norm_query and norm_query in _normalize_str(lines[i]):
-            headline = lines[i].strip()
-            ctx = []
-            j = i + 1
-            while j < len(lines) and len(ctx) < 6:
-                l2 = lines[j].strip()
-                if not l2:
-                    break
-                if _normalize_str(l2) == _normalize_str("Load More"):
-                    break
-                ctx.append(l2)
-                j += 1
-
-            results.append(
-                {
-                    "headline": headline,
-                    "summary": " ".join(ctx).strip(),
-                }
-            )
-            i = j
-        else:
-            i += 1
-
-    return results
+    return matches
 
 
 def _find_nbc_news_for_player(player: Dict[str, Any], max_items: int = 2) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """
-    Amélioration : on essaye plusieurs URLs NBC dans cet ordre :
-    1) Team player-news (si team abbr connue)
-    2) NBA Player News (non-fantasy)
-    3) Fantasy player-news
-    """
     full_name = player.get("full_name") or ""
     team = player.get("team") or {}
     abbr = (team.get("abbreviation") or "").upper()
 
     attempted_urls: List[str] = []
-    urls_to_try: List[str] = []
+    urls: List[str] = []
 
     team_slug = TEAM_SLUG_BY_ABBR.get(abbr)
     if team_slug:
-        urls_to_try.append(NBC_TEAM_PLAYER_NEWS_TEMPLATE.format(team_slug=team_slug))
+        urls.append(NBC_TEAM_PLAYER_NEWS_TEMPLATE.format(team_slug=team_slug))
+    urls.append(NBC_NBA_PLAYER_NEWS_URL)
+    urls.append(NBC_FANTASY_PLAYER_NEWS_URL)
 
-    urls_to_try.append(NBC_NBA_PLAYER_NEWS_URL)
-    urls_to_try.append(NBC_FANTASY_PLAYER_NEWS_URL)
-
-    for url in urls_to_try:
+    for url in urls:
         attempted_urls.append(url)
         html = _fetch_nbc_html(url)
-        matches = _extract_nbc_matches_from_html(html, full_name, max_items=max_items)
-        if matches:
-            # on annote la source URL pour debug
-            for m in matches:
-                m["source"] = "nbc"
-                m["url"] = url
-            return matches, attempted_urls
+        items = _extract_nbc_matches_from_html(html, full_name, max_items=max_items)
+        if items:
+            for it in items:
+                it["url"] = url
+                it["source"] = "nbc"
+            return items, attempted_urls
 
     return [], attempted_urls
 
@@ -531,23 +571,12 @@ def injuries_by_player_id(player_id: int) -> Dict[str, Any]:
     }
 
 
-@app.get("/nbc/raw")
-def nbc_raw() -> Dict[str, Any]:
-    html = _fetch_nbc_html(NBC_FANTASY_PLAYER_NEWS_URL)
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True) if html else ""
-    return {"source": "nbc", "url": NBC_FANTASY_PLAYER_NEWS_URL, "status_code": 200 if html else 502, "content_snippet": text[:500]}
-
-
 @app.get("/injuries/nbc")
 def injuries_nbc(name: str) -> Dict[str, Any]:
-    """
-    Debug simple : on cherche uniquement sur NBA Player News (non-fantasy) + fantasy.
-    (Le vrai usage est /injuries/by-player-id, qui sait la team du joueur.)
-    """
     if not name:
         raise HTTPException(status_code=400, detail="name must not be empty")
 
+    # debug: on tente NBA Player News + fantasy
     fake_player = {"full_name": name, "team": {"abbreviation": ""}}
     items, attempted = _find_nbc_news_for_player(fake_player, max_items=3)
     return {"source": "nbc", "player_query": name, "count": len(items), "items": items, "attempted_urls": attempted}
@@ -601,7 +630,16 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
       justify-content: space-between;
       gap: 12px;
     }
-    .ia-player-left { display: flex; flex-direction: column; gap: 2px; }
+    .ia-player-left { display: flex; align-items: center; gap: 10px; }
+    .ia-team-logo {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      background: #020617;
+      border: 1px solid rgba(148,163,184,.35);
+      object-fit: contain;
+    }
+    .ia-player-text { display: flex; flex-direction: column; gap: 2px; }
     .ia-player-name { font-size: 16px; font-weight: 800; color: #f9fafb; }
     .ia-player-meta { font-size: 12px; color: #9ca3af; }
     .ia-badge {
@@ -637,7 +675,7 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="ia-shell">
     <div class="ia-card">
       <h1 class="ia-title">NBA Injury Checker</h1>
-      <p class="ia-subtitle">Recherche fiable via player_id (plus d’erreurs d’homonymes).</p>
+      <p class="ia-subtitle">Sélection fiable via player_id (et NBC sans faux positifs).</p>
 
       <div class="ia-search-row">
         <div class="ia-search">
@@ -655,8 +693,11 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div id="ia-player-card" class="ia-player-card">
         <div class="ia-player-left">
-          <div id="ia-player-name" class="ia-player-name"></div>
-          <div id="ia-player-meta" class="ia-player-meta"></div>
+          <img id="ia-team-logo" class="ia-team-logo" alt="" />
+          <div class="ia-player-text">
+            <div id="ia-player-name" class="ia-player-name"></div>
+            <div id="ia-player-meta" class="ia-player-meta"></div>
+          </div>
         </div>
         <div id="ia-player-badge" class="ia-badge"></div>
       </div>
@@ -700,6 +741,7 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
       const playerNameEl = document.getElementById("ia-player-name");
       const playerMetaEl = document.getElementById("ia-player-meta");
       const playerBadgeEl = document.getElementById("ia-player-badge");
+      const teamLogoEl = document.getElementById("ia-team-logo");
 
       const srcBdl = document.querySelector("#ia-src-bdl .ia-col-body");
       const srcEspn = document.querySelector("#ia-src-espn .ia-col-body");
@@ -708,6 +750,12 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       let selectedPlayer = null;
       let suggTimeout = null;
+
+      // Logos ESPN CDN: https://a.espncdn.com/i/teamlogos/nba/500/{abbr}.png
+      function teamLogoUrl(abbr) {
+        if (!abbr) return "";
+        return "https://a.espncdn.com/i/teamlogos/nba/500/" + abbr.toLowerCase() + ".png";
+      }
 
       function norm(s) {
         if (!s) return "";
@@ -817,6 +865,15 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
         playerNameEl.textContent = name;
         playerMetaEl.textContent = [abbr, pos].filter(Boolean).join(" · ");
 
+        const logo = teamLogoUrl(abbr);
+        if (logo) {
+          teamLogoEl.src = logo;
+          teamLogoEl.style.display = "block";
+        } else {
+          teamLogoEl.src = "";
+          teamLogoEl.style.display = "none";
+        }
+
         const agg = data.aggregated || {};
         const status = agg.status || "clear";
 
@@ -895,17 +952,11 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         const nbcInj = (data.sources?.nbc?.injuries || [])[0];
         if (!nbcInj) {
-          // Optionnel : affiche où on a cherché
-          const attempted = data.sources?.nbc?.attempted_urls || [];
-          if (attempted.length) {
-            srcNbc.innerHTML = '<span class="ia-badge-empty">Aucune info (testé: ' + attempted.length + ' URLs)</span>';
-          } else {
-            renderEmpty(srcNbc);
-          }
+          renderEmpty(srcNbc);
         } else {
           srcNbc.innerHTML =
             '<p class="ia-status">' + (nbcInj.headline || "NBC") + "</p>" +
-            (nbcInj.summary ? '<p class="ia-meta">' + nbcInj.summary + "</p>" : "") +
+            (nbcInj.summary ? '<p class="ia-meta">' + nbcInj.summary + "</p>' : "") +
             (nbcInj.url ? '<p class="ia-meta">' + nbcInj.url + "</p>" : "");
         }
       }
