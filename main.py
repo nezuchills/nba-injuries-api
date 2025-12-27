@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 import os
 import json
 import requests
@@ -20,49 +20,21 @@ app.add_middleware(
 )
 
 # ============================================================
-#                     ENDPOINTS DE BASE
-# ============================================================
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
-
-
-@app.get("/")
-def root():
-    return {"message": "NBA injuries API is running"}
-
-
-# ============================================================
 #                    HELPERS NOM / MATCHING
 # ============================================================
 
 _SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 
+
 def _normalize_str(s: str) -> str:
-    """
-    Normalisation agressive pour matching de noms :
-    - lower
-    - suppression accents
-    - suppression ponctuation (garde espaces)
-    - collapse espaces
-    - suppression suffixes (jr/sr/ii/iii/iv...)
-    """
     s = s or ""
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = s.lower()
-
-    # remplace tout ce qui n'est pas lettre/chiffre/espace par un espace
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
     tokens = [t for t in s.split(" ") if t and t not in _SUFFIXES]
     return " ".join(tokens)
-
-
-def _names_equal(a: str, b: str) -> bool:
-    return _normalize_str(a) == _normalize_str(b)
 
 
 # ============================================================
@@ -77,9 +49,6 @@ def _get_balldontlie_api_key() -> str:
 
 
 def _call_balldontlie(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 12) -> Dict[str, Any]:
-    """
-    BallDontLie API base. Docs : /v1/players, /v1/players/active, /v1/player_injuries. [web:27]
-    """
     api_key = _get_balldontlie_api_key()
     base_url = "https://api.balldontlie.io"
     url = f"{base_url}{path}"
@@ -160,7 +129,7 @@ def _load_active_players() -> None:
         return
 
     players: List[Dict[str, Any]] = []
-    players_by_id: Dict[int, Dict[str, Any]] = {}
+    by_id: Dict[int, Dict[str, Any]] = {}
 
     cursor: Optional[int] = None
     while True:
@@ -169,22 +138,43 @@ def _load_active_players() -> None:
             params["cursor"] = cursor
 
         resp = _call_balldontlie("/v1/players/active", params=params)
-        data = resp.get("data", [])
+        data = resp.get("data", []) or []
         meta = resp.get("meta", {}) or {}
 
         for p in data:
             mapped = _map_bdl_player(p)
             players.append(mapped)
-            if mapped.get("id") is not None:
-                players_by_id[int(mapped["id"])] = mapped
+            pid = mapped.get("id")
+            if pid is not None:
+                by_id[int(pid)] = mapped
 
         cursor = meta.get("next_cursor")
         if not cursor:
             break
 
     ACTIVE_PLAYERS = players
-    ACTIVE_PLAYERS_BY_ID = players_by_id
+    ACTIVE_PLAYERS_BY_ID = by_id
     ACTIVE_PLAYERS_LOADED = True
+
+
+def _get_player_from_cache(player_id: int) -> Dict[str, Any]:
+    _load_active_players()
+    p = ACTIVE_PLAYERS_BY_ID.get(int(player_id))
+    if not p:
+        raise HTTPException(status_code=404, detail=f"Active player_id not found: {player_id}")
+    return p
+
+
+def _get_bdl_injuries_for_player_id(player_id: int) -> List[Dict[str, Any]]:
+    raw = _call_balldontlie("/v1/player_injuries", params={"per_page": 100})
+    data = raw.get("data", []) or []
+
+    out: List[Dict[str, Any]] = []
+    for item in data:
+        pl = (item.get("player") or {})
+        if pl.get("id") == player_id:
+            out.append(_map_bdl_injury(item))
+    return out
 
 
 @app.get("/players/active/local")
@@ -193,58 +183,22 @@ def players_active_local() -> Dict[str, Any]:
     return {"source": "balldontlie", "count": len(ACTIVE_PLAYERS), "players": ACTIVE_PLAYERS}
 
 
-@app.get("/players/active/search")
-def players_active_search(q: str, limit: int = 10) -> Dict[str, Any]:
-    """
-    Recherche locale (sur le cache active players) pour aider le front.
-    """
-    _load_active_players()
-    query = _normalize_str(q)
-    if not query or len(query) < 2:
-        return {"query": q, "count": 0, "players": []}
-
-    matches = []
-    for p in ACTIVE_PLAYERS:
-        fn = p.get("full_name") or ""
-        if query in _normalize_str(fn):
-            matches.append(p)
-            if len(matches) >= max(1, min(limit, 50)):
-                break
-
-    return {"query": q, "count": len(matches), "players": matches}
-
-
-def _resolve_player_id_from_name_strict(name: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Résolution STRICTE : pas de fallback "last name only", pas de "take first result".
-    - exact match normalisé sur full_name des joueurs actifs
-    - sinon renvoie une liste de candidats (contains) pour aider l'utilisateur
-    """
-    _load_active_players()
-    q = _normalize_str(name)
-
-    exact = [p for p in ACTIVE_PLAYERS if _normalize_str(p.get("full_name") or "") == q]
-    if len(exact) == 1:
-        return exact[0], []
-
-    # candidats (contains) uniquement pour debug / UI (sans auto-select)
-    candidates = [p for p in ACTIVE_PLAYERS if q and q in _normalize_str(p.get("full_name") or "")]
-    return None, candidates[:10]
-
-
 # ============================================================
 #                            ESPN
 # ============================================================
 
 ESPN_INJURIES_URL = "https://www.espn.com/nba/injuries"
 
+
 def _fetch_espn_html() -> str:
     try:
         resp = requests.get(ESPN_INJURIES_URL, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Error calling ESPN: {e}")
+
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"ESPN error: {resp.text[:200]}")
+
     return resp.text
 
 
@@ -296,38 +250,27 @@ def _parse_espn_injuries(html: str) -> List[Dict[str, Any]]:
     return results
 
 
-@app.get("/espn/raw")
-def espn_raw() -> Dict[str, Any]:
-    html = _fetch_espn_html()
-    return {"source": "espn", "url": ESPN_INJURIES_URL, "status_code": 200, "content_snippet": html[:500]}
-
-
-@app.get("/injuries/espn")
-def injuries_espn() -> Dict[str, Any]:
-    html = _fetch_espn_html()
-    parsed = _parse_espn_injuries(html)
-    return {"source": "espn", "count": len(parsed), "injuries": parsed}
-
-
 # ============================================================
 #                            CBS
 # ============================================================
 
 CBS_INJURIES_URL = "https://www.cbssports.com/nba/injuries/"
 
+
 def _fetch_cbs_html() -> str:
     try:
         resp = requests.get(CBS_INJURIES_URL, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Error calling CBS: {e}")
+
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"CBS error: {resp.text[:200]}")
+
     return resp.text
 
 
 def _clean_cbs_player_name(raw: str) -> str:
     s = (raw or "").strip()
-    # ton ancien fix "sport + NameCollé"
     split_idx = None
     for i in range(1, len(s)):
         if s[i - 1].islower() and s[i].isupper():
@@ -389,39 +332,26 @@ def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
     return results
 
 
-@app.get("/cbs/raw")
-def cbs_raw() -> Dict[str, Any]:
-    html = _fetch_cbs_html()
-    return {"source": "cbs", "url": CBS_INJURIES_URL, "status_code": 200, "content_snippet": html[:500]}
-
-
-@app.get("/injuries/cbs")
-def injuries_cbs() -> Dict[str, Any]:
-    html = _fetch_cbs_html()
-    parsed = _parse_cbs_injuries(html)
-    return {"source": "cbs", "count": len(parsed), "injuries": parsed}
-
-
 # ============================================================
 #                      NBC (Rotoworld)
 # ============================================================
 
 NBC_NEWS_URL = "https://www.nbcsports.com/fantasy/basketball/player-news"
 
+
 def _fetch_nbc_news_html() -> str:
     try:
         resp = requests.get(NBC_NEWS_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Error calling NBC Rotoworld: {e}")
+
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"NBC Rotoworld error: {resp.text[:200]}")
+
     return resp.text
 
 
 def _find_nbc_news_for_player(query_name: str, max_items: int = 2) -> List[Dict[str, Any]]:
-    """
-    Cherche des occurrences dans le HTML statique de la page (limité aux news récentes).
-    """
     html = _fetch_nbc_news_html()
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n", strip=True)
@@ -430,7 +360,6 @@ def _find_nbc_news_for_player(query_name: str, max_items: int = 2) -> List[Dict[
     norm_query = _normalize_str(query_name)
     results: List[Dict[str, Any]] = []
 
-    # On essaye de limiter après "NBA Player News" si possible
     start_idx = 0
     for idx, line in enumerate(lines):
         if _normalize_str(line) == _normalize_str("NBA Player News"):
@@ -447,25 +376,77 @@ def _find_nbc_news_for_player(query_name: str, max_items: int = 2) -> List[Dict[
                 l2 = lines[j].strip()
                 if not l2:
                     break
-                # stop si gros séparateur
-                if _normalize_str(l2) in {_normalize_str("Load More")}:
+                if _normalize_str(l2) == _normalize_str("Load More"):
                     break
                 ctx.append(l2)
                 j += 1
 
             results.append(
-                {
-                    "player_query": query_name,
-                    "headline": headline,
-                    "summary": " ".join(ctx).strip(),
-                    "source": "nbc_rotoworld",
-                }
+                {"player_query": query_name, "headline": headline, "summary": " ".join(ctx).strip(), "source": "nbc_rotoworld"}
             )
             i = j
         else:
             i += 1
 
     return results
+
+
+# ============================================================
+#                  ENDPOINTS API (JSON)
+# ============================================================
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+@app.get("/")
+def root():
+    return {"message": "NBA injuries API is running"}
+
+
+@app.get("/injuries/by-player-id")
+def injuries_by_player_id(player_id: int) -> Dict[str, Any]:
+    p = _get_player_from_cache(player_id)
+    full_name = p.get("full_name") or ""
+    player_norm = _normalize_str(full_name)
+
+    espn_all = _parse_espn_injuries(_fetch_espn_html())
+    espn_matches = [it for it in espn_all if _normalize_str(it.get("player_name", "")) == player_norm]
+
+    cbs_all = _parse_cbs_injuries(_fetch_cbs_html())
+    cbs_matches = [it for it in cbs_all if _normalize_str(it.get("player_name", "")) == player_norm]
+
+    nbc_matches = _find_nbc_news_for_player(full_name, max_items=2)
+
+    bdl_injuries = _get_bdl_injuries_for_player_id(player_id)
+
+    sources_with_info = []
+    if bdl_injuries:
+        sources_with_info.append("balldontlie")
+    if espn_matches:
+        sources_with_info.append("espn")
+    if cbs_matches:
+        sources_with_info.append("cbs")
+    if nbc_matches:
+        sources_with_info.append("nbc_rotoworld")
+
+    aggregated = {
+        "status": "flagged" if sources_with_info else "clear",
+        "sources_with_info": sources_with_info,
+    }
+
+    return {
+        "player_id": player_id,
+        "player": p,
+        "aggregated": aggregated,
+        "sources": {
+            "balldontlie": {"injuries": bdl_injuries},
+            "espn": {"injuries": espn_matches, "total_injuries_checked": len(espn_all)},
+            "cbs": {"injuries": cbs_matches, "total_injuries_checked": len(cbs_all)},
+            "nbc": {"injuries": nbc_matches},
+        },
+    }
 
 
 @app.get("/nbc/raw")
@@ -489,269 +470,63 @@ def injuries_nbc(name: Optional[str] = None) -> Dict[str, Any]:
 
 
 # ============================================================
-#            AGRÉGATION PAR player_id (FIX PRINCIPAL)
+#                      WIDGET (HTML)
 # ============================================================
 
-def _compute_aggregated_status(
-    bdl_injuries: List[Dict[str, Any]],
-    espn_matches: List[Dict[str, Any]],
-    cbs_matches: List[Dict[str, Any]],
-    nbc_matches: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    sources_with_info: List[str] = []
-    if bdl_injuries:
-        sources_with_info.append("balldontlie")
-    if espn_matches:
-        sources_with_info.append("espn")
-    if cbs_matches:
-        sources_with_info.append("cbs")
-    if nbc_matches:
-        sources_with_info.append("nbc_rotoworld")
-
-    status = "flagged" if sources_with_info else "clear"
-    return {"status": status, "sources_with_info": sources_with_info}
-
-
-def _get_player_from_cache(player_id: int) -> Dict[str, Any]:
-    _load_active_players()
-    p = ACTIVE_PLAYERS_BY_ID.get(int(player_id))
-    if not p:
-        raise HTTPException(status_code=404, detail=f"Active player_id not found: {player_id}")
-    return p
-
-
-def _get_bdl_injuries_for_player_id(player_id: int) -> List[Dict[str, Any]]:
-    # API BallDontLie : /v1/player_injuries [web:27]
-    raw = _call_balldontlie("/v1/player_injuries", params={"per_page": 100})
-    data = raw.get("data", []) or []
-
-    out = []
-    for item in data:
-        pl = (item.get("player") or {})
-        if pl.get("id") == player_id:
-            out.append(_map_bdl_injury(item))
-    return out
-
-
-@app.get("/injuries/by-player-id")
-def injuries_by_player_id(player_id: int) -> Dict[str, Any]:
-    """
-    Endpoint à utiliser côté dashboard/widget : pas de ambiguïté.
-    """
-    p = _get_player_from_cache(player_id)
-    player_full_name = p.get("full_name") or ""
-    player_norm = _normalize_str(player_full_name)
-
-    # ESPN
-    espn_html = _fetch_espn_html()
-    espn_all = _parse_espn_injuries(espn_html)
-    espn_matches = [it for it in espn_all if _normalize_str(it.get("player_name", "")) == player_norm]
-
-    # CBS
-    cbs_html = _fetch_cbs_html()
-    cbs_all = _parse_cbs_injuries(cbs_html)
-    cbs_matches = [it for it in cbs_all if _normalize_str(it.get("player_name", "")) == player_norm]
-
-    # NBC (news)
-    nbc_matches = _find_nbc_news_for_player(player_full_name, max_items=2)
-
-    # BallDontLie injuries par id
-    bdl_injuries = _get_bdl_injuries_for_player_id(player_id)
-
-    aggregated = _compute_aggregated_status(
-        bdl_injuries=bdl_injuries,
-        espn_matches=espn_matches,
-        cbs_matches=cbs_matches,
-        nbc_matches=nbc_matches,
-    )
-
-    return {
-        "player_id": player_id,
-        "player": p,
-        "aggregated": aggregated,
-        "sources": {
-            "balldontlie": {"injuries": bdl_injuries},
-            "espn": {"injuries": espn_matches, "total_injuries_checked": len(espn_all)},
-            "cbs": {"injuries": cbs_matches, "total_injuries_checked": len(cbs_all)},
-            "nbc": {"injuries": nbc_matches},
-        },
-    }
-
-
-# Compat backward: name -> player_id (STRICT, sinon erreur)
-@app.get("/injuries/by-player")
-def injuries_by_player(name: str) -> Dict[str, Any]:
-    query = (name or "").strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="name parameter must not be empty")
-
-    matched, candidates = _resolve_player_id_from_name_strict(query)
-    if not matched:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "Ambiguous or unknown player name. Select from autocomplete.",
-                "query": query,
-                "candidates": candidates,
-            },
-        )
-
-    return injuries_by_player_id(player_id=int(matched["id"]))
-
-
-# ============================================================
-#                        UI WIDGET HTML
-# ============================================================
-
-@app.get("/widget", response_class=HTMLResponse)
-def widget() -> str:
-    _load_active_players()
-    players_json = json.dumps(ACTIVE_PLAYERS)
-
-    return f"""
-<!DOCTYPE html>
+WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
   <title>NBA Injury Checker</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body {{
-      margin: 0;
-      padding: 0;
-      background: #020617;
-      color: #e5e7eb;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
-    }}
-    * {{ box-sizing: border-box; }}
-    .ia-shell {{ max-width: 1040px; margin: 0 auto; padding: 28px 12px 40px; }}
-    .ia-card {{
-      padding: 24px 20px 26px;
-      border-radius: 20px;
-      background: radial-gradient(circle at top left, #1e293b 0, #020617 45%, #000 100%);
-      border: 1px solid rgba(148, 163, 184, 0.35);
-      box-shadow: 0 32px 80px rgba(0,0,0,0.75), 0 0 0 1px rgba(15,23,42,0.65);
-    }}
-    .ia-title {{ margin: 0 0 6px; font-size: 26px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; text-align: center; }}
-    .ia-subtitle {{ margin: 0 0 18px; font-size: 13px; color: #9ca3af; text-align: center; }}
-    .ia-search-row {{ display: flex; gap: 8px; margin-bottom: 10px; align-items: center; }}
-    .ia-search {{ flex: 1; display: flex; gap: 10px; position: relative; z-index: 2; }}
-    .ia-search-input-wrap {{ flex: 1; position: relative; }}
-    #ia-player-input {{
-      width: 100%;
-      padding: 11px 12px;
-      border-radius: 10px;
-      border: 1px solid rgba(148, 163, 184, 0.65);
-      background: rgba(15, 23, 42, 0.96);
-      color: #f9fafb;
-      font-size: 14px;
-      outline: none;
-    }}
-    #ia-player-input:focus {{ border-color: #60a5fa; box-shadow: 0 0 0 1px rgba(37,99,235,0.7); }}
-    #ia-search-btn {{
-      padding: 11px 16px;
-      border-radius: 10px;
-      border: none;
-      background: linear-gradient(to right, #2563eb, #4f46e5);
-      color: #f9fafb;
-      font-weight: 600;
-      font-size: 14px;
-      cursor: pointer;
-      white-space: nowrap;
-    }}
-    #ia-search-btn:disabled {{ opacity: 0.6; cursor: default; }}
-    #ia-reset-btn {{
-      padding: 9px 12px;
-      border-radius: 10px;
-      border: 1px solid rgba(148, 163, 184, 0.7);
-      background: rgba(15, 23, 42, 0.96);
-      color: #e5e7eb;
-      font-size: 12px;
-      cursor: pointer;
-      white-space: nowrap;
-    }}
-    .ia-suggestions {{
-      position: absolute;
-      left: 0; right: 0;
-      top: calc(100% + 4px);
-      max-height: 220px;
-      overflow-y: auto;
-      background: #020617;
-      border-radius: 10px;
-      border: 1px solid rgba(148, 163, 184, 0.7);
-      box-shadow: 0 18px 40px rgba(0,0,0,0.9);
-      z-index: 50;
-    }}
-    .ia-suggestion-item {{
-      padding: 7px 10px;
-      font-size: 13px;
-      cursor: pointer;
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-    }}
-    .ia-suggestion-item:nth-child(2n) {{ background: rgba(15,23,42,0.9); }}
-    .ia-suggestion-item:hover {{ background: rgba(37,99,235,0.25); }}
-    .ia-suggestion-name {{ font-weight: 500; }}
-    .ia-suggestion-meta {{ color: #9ca3af; font-size: 12px; }}
-    .ia-loader {{ margin: 6px 0 4px; font-size: 13px; }}
-    .ia-error {{
-      margin: 8px 0 6px;
-      padding: 8px 10px;
-      border-radius: 8px;
-      background: rgba(248,113,113,0.1);
-      border: 1px solid rgba(248,113,113,0.7);
-      color: #fecaca;
-      font-size: 13px;
-      display: none;
-    }}
-    .ia-grid {{
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      margin-top: 12px;
-    }}
-    @media (max-width: 900px) {{ .ia-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
-    @media (max-width: 600px) {{ .ia-grid {{ grid-template-columns: minmax(0, 1fr); }} }}
-    .ia-col {{
-      background: rgba(15,23,42,0.97);
-      border-radius: 12px;
-      border: 1px solid rgba(148,163,184,0.6);
-      overflow: hidden;
-    }}
-    .ia-col-header {{
-      padding: 6px 9px;
-      border-bottom: 1px solid rgba(148,163,184,0.5);
-      background: linear-gradient(to right, rgba(30,64,175,0.65), rgba(15,23,42,0.95));
-    }}
-    .ia-col-label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.14em; }}
-    .ia-col-body {{ padding: 8px 9px 10px; }}
-    .ia-col-body p {{ margin: 0 0 4px; font-size: 13px; }}
-    .ia-badge-empty {{
-      display: inline-block;
-      padding: 4px 8px;
-      border-radius: 999px;
-      border: 1px dashed rgba(148,163,184,0.7);
-      font-size: 11px;
-      color: #9ca3af;
-    }}
-    .ia-status {{ font-weight: 500; }}
-    .ia-meta {{ font-size: 12px; color: #9ca3af; }}
+    body { margin: 0; padding: 0; background: #020617; color: #e5e7eb; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+    * { box-sizing: border-box; }
+    .ia-shell { max-width: 1040px; margin: 0 auto; padding: 28px 12px 40px; }
+    .ia-card { padding: 24px 20px 26px; border-radius: 20px; background: #0b1220; border: 1px solid rgba(148,163,184,.35); }
+    .ia-title { margin: 0 0 6px; font-size: 24px; font-weight: 700; text-transform: uppercase; text-align: center; }
+    .ia-subtitle { margin: 0 0 18px; font-size: 13px; color: #9ca3af; text-align: center; }
+    .ia-search-row { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; }
+    .ia-search { flex: 1; display: flex; gap: 10px; position: relative; }
+    .ia-search-input-wrap { flex: 1; position: relative; }
+    #ia-player-input { width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid rgba(148,163,184,.65); background: rgba(15,23,42,.96); color: #f9fafb; font-size: 14px; outline: none; }
+    #ia-search-btn { padding: 11px 16px; border-radius: 10px; border: none; background: #3b82f6; color: #fff; font-weight: 700; cursor: pointer; }
+    #ia-search-btn:disabled { opacity: .6; cursor: default; }
+    #ia-reset-btn { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(148,163,184,.7); background: rgba(15,23,42,.96); color: #e5e7eb; font-size: 12px; cursor: pointer; white-space: nowrap; }
+    .ia-suggestions { position: absolute; left: 0; right: 0; top: calc(100% + 4px); max-height: 220px; overflow-y: auto; background: #020617; border-radius: 10px; border: 1px solid rgba(148,163,184,.7); z-index: 50; }
+    .ia-suggestion-item { padding: 7px 10px; font-size: 13px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+    .ia-suggestion-item:nth-child(2n) { background: rgba(15,23,42,.9); }
+    .ia-suggestion-item:hover { background: rgba(59,130,246,.25); }
+    .ia-suggestion-name { font-weight: 600; }
+    .ia-suggestion-meta { color: #9ca3af; font-size: 12px; }
+    .ia-loader { margin: 6px 0 4px; font-size: 13px; display: none; }
+    .ia-error { margin: 8px 0 6px; padding: 8px 10px; border-radius: 8px; background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.7); color: #fecaca; font-size: 13px; display: none; }
+    .ia-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; margin-top: 12px; }
+    @media (max-width: 900px) { .ia-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+    @media (max-width: 600px) { .ia-grid { grid-template-columns: minmax(0,1fr); } }
+    .ia-col { background: rgba(15,23,42,.97); border-radius: 12px; border: 1px solid rgba(148,163,184,.6); overflow: hidden; }
+    .ia-col-header { padding: 6px 9px; border-bottom: 1px solid rgba(148,163,184,.5); background: rgba(30,64,175,.35); }
+    .ia-col-label { font-size: 11px; text-transform: uppercase; letter-spacing: .14em; }
+    .ia-col-body { padding: 8px 9px 10px; }
+    .ia-col-body p { margin: 0 0 4px; font-size: 13px; }
+    .ia-badge-empty { display: inline-block; padding: 4px 8px; border-radius: 999px; border: 1px dashed rgba(148,163,184,.7); font-size: 11px; color: #9ca3af; }
+    .ia-status { font-weight: 600; }
+    .ia-meta { font-size: 12px; color: #9ca3af; }
   </style>
   <script>
-    window.__ACTIVE_PLAYERS__ = {players_json};
+    window.__ACTIVE_PLAYERS__ = __ACTIVE_PLAYERS_JSON__;
   </script>
 </head>
 <body>
   <div class="ia-shell">
     <div class="ia-card">
       <h1 class="ia-title">NBA Injury Checker</h1>
-      <p class="ia-subtitle">Recherche fiable via player_id (plus d’erreurs Edwards/Johnson).</p>
+      <p class="ia-subtitle">Sélection fiable via player_id (plus d’erreurs Edwards/Johnson).</p>
 
       <div class="ia-search-row">
         <div class="ia-search">
           <div class="ia-search-input-wrap">
-            <input id="ia-player-input" type="text" placeholder="Commence à taper puis clique une suggestion" autocomplete="off" />
+            <input id="ia-player-input" type="text" placeholder="Tape puis clique une suggestion" autocomplete="off" />
             <div id="ia-suggestions" class="ia-suggestions" style="display:none;"></div>
           </div>
           <button id="ia-search-btn">Chercher</button>
@@ -759,7 +534,7 @@ def widget() -> str:
         <button id="ia-reset-btn" type="button">Réinitialiser</button>
       </div>
 
-      <div id="ia-loader" class="ia-loader" style="display:none;">Recherche en cours...</div>
+      <div id="ia-loader" class="ia-loader">Recherche en cours...</div>
       <div id="ia-error" class="ia-error"></div>
 
       <div id="ia-results" style="display:none;">
@@ -782,13 +557,13 @@ def widget() -> str:
           </div>
         </div>
       </div>
-
     </div>
   </div>
 
   <script>
     (function () {
       const ACTIVE_PLAYERS = window.__ACTIVE_PLAYERS__ || [];
+
       const input = document.getElementById("ia-player-input");
       const searchBtn = document.getElementById("ia-search-btn");
       const resetBtn = document.getElementById("ia-reset-btn");
@@ -808,8 +583,7 @@ def widget() -> str:
       function norm(s) {
         if (!s) return "";
         s = s.normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
-        s = s.toLowerCase().replace(/[^a-z0-9\\s]/g, " ").replace(/\\s+/g, " ").trim();
-        // remove suffix tokens
+        s = s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
         const parts = s.split(" ").filter(x => x && !["jr","sr","ii","iii","iv","v"].includes(x));
         return parts.join(" ");
       }
@@ -871,7 +645,7 @@ def widget() -> str:
           div.appendChild(right);
 
           div.addEventListener("click", function () {
-            selectedPlayer = p;               // <= CLÉ : on conserve l'id
+            selectedPlayer = p;     // IMPORTANT: garde l'id
             input.value = p.full_name;
             closeSuggestions();
             searchPlayer();
@@ -895,7 +669,6 @@ def widget() -> str:
       }
 
       function resolveSelectedIfExactName() {
-        // Si l’utilisateur tape puis Enter sans cliquer, on tente un match EXACT sur full_name
         const nq = norm(input.value || "");
         const exact = ACTIVE_PLAYERS.filter(p => norm(p.full_name) === nq);
         if (exact.length === 1) {
@@ -919,7 +692,6 @@ def widget() -> str:
         }
 
         setLoading(true);
-
         try {
           const url = "/injuries/by-player-id?player_id=" + encodeURIComponent(selectedPlayer.id);
           const res = await fetch(url, { method: "GET" });
@@ -999,14 +771,10 @@ def widget() -> str:
       });
 
       input.addEventListener("input", function () {
-        // Si l'utilisateur retape, on invalide la sélection précédente
         selectedPlayer = null;
-
         const q = (input.value || "").trim();
         if (suggTimeout) clearTimeout(suggTimeout);
-        suggTimeout = setTimeout(function () {
-          fetchSuggestionsLocal(q);
-        }, 120);
+        suggTimeout = setTimeout(function () { fetchSuggestionsLocal(q); }, 120);
       });
 
       document.addEventListener("click", function (e) {
@@ -1016,22 +784,11 @@ def widget() -> str:
   </script>
 </body>
 </html>
-    """
+"""
 
 
-# ============================================================
-#                    DEBUG / TEST ENDPOINTS
-# ============================================================
-
-@app.get("/debug/resolve-name")
-def debug_resolve_name(name: str) -> Dict[str, Any]:
-    """
-    Pour diagnostiquer les cas "Anthony Edwards -> Vincent Edwards".
-    Ici on refuse la devinette : soit exact, soit candidats.
-    """
-    matched, candidates = _resolve_player_id_from_name_strict(name)
-    return {
-        "query": name,
-        "matched": matched,
-        "candidates": candidates,
-    }
+@app.get("/widget", response_class=HTMLResponse)
+def widget() -> str:
+    _load_active_players()
+    players_json = json.dumps(ACTIVE_PLAYERS, ensure_ascii=False)
+    return WIDGET_HTML_TEMPLATE.replace("__ACTIVE_PLAYERS_JSON__", players_json)
