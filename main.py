@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import os
 import json
 import requests
@@ -333,36 +333,80 @@ def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-#                      NBC (Rotoworld)
+#                      NBC (Rotoworld/NBC)
 # ============================================================
 
-NBC_NEWS_URL = "https://www.nbcsports.com/fantasy/basketball/player-news"
+# Feed fantasy (souvent bruité / pas toujours le joueur) [web:14]
+NBC_FANTASY_PLAYER_NEWS_URL = "https://www.nbcsports.com/fantasy/basketball/player-news"
+
+# Page NBA Player News (non-fantasy) [web:383]
+NBC_NBA_PLAYER_NEWS_URL = "https://www.nbcsports.com/nba/nba/player-news"
+
+# Pages "Team player news" (format /nba/{team-slug}/player-news) [web:395]
+NBC_TEAM_PLAYER_NEWS_TEMPLATE = "https://www.nbcsports.com/nba/{team_slug}/player-news"
+
+TEAM_SLUG_BY_ABBR = {
+    "ATL": "atlanta-hawks",
+    "BOS": "boston-celtics",
+    "BKN": "brooklyn-nets",
+    "CHA": "charlotte-hornets",
+    "CHI": "chicago-bulls",
+    "CLE": "cleveland-cavaliers",
+    "DAL": "dallas-mavericks",
+    "DEN": "denver-nuggets",
+    "DET": "detroit-pistons",
+    "GSW": "golden-state-warriors",
+    "HOU": "houston-rockets",
+    "IND": "indiana-pacers",
+    "LAC": "los-angeles-clippers",
+    "LAL": "los-angeles-lakers",
+    "MEM": "memphis-grizzlies",
+    "MIA": "miami-heat",
+    "MIL": "milwaukee-bucks",
+    "MIN": "minnesota-timberwolves",
+    "NOP": "new-orleans-pelicans",
+    "NYK": "new-york-knicks",
+    "OKC": "oklahoma-city-thunder",
+    "ORL": "orlando-magic",
+    "PHI": "philadelphia-76ers",
+    "PHX": "phoenix-suns",
+    "POR": "portland-trail-blazers",
+    "SAC": "sacramento-kings",
+    "SAS": "san-antonio-spurs",
+    "TOR": "toronto-raptors",
+    "UTA": "utah-jazz",
+    "WAS": "washington-wizards",
+}
 
 
-def _fetch_nbc_news_html() -> str:
+def _fetch_nbc_html(url: str) -> str:
     try:
-        resp = requests.get(NBC_NEWS_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error calling NBC Rotoworld: {e}")
+        raise HTTPException(status_code=502, detail=f"Error calling NBC: {e}")
 
     if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=f"NBC Rotoworld error: {resp.text[:200]}")
+        # On ne raise pas systématiquement ici, car on essaye plusieurs URLs
+        return ""
 
     return resp.text
 
 
-def _find_nbc_news_for_player(query_name: str, max_items: int = 2) -> List[Dict[str, Any]]:
-    html = _fetch_nbc_news_html()
+def _extract_nbc_matches_from_html(html: str, player_full_name: str, max_items: int = 2) -> List[Dict[str, Any]]:
+    if not html:
+        return []
+
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n", strip=True)
     lines = [l for l in text.split("\n") if l.strip()]
 
-    norm_query = _normalize_str(query_name)
+    norm_query = _normalize_str(player_full_name)
     results: List[Dict[str, Any]] = []
 
+    # Limite après un header si présent (mais on reste robuste)
     start_idx = 0
     for idx, line in enumerate(lines):
-        if _normalize_str(line) == _normalize_str("NBA Player News"):
+        if _normalize_str(line) in {_normalize_str("NBA Player News"), _normalize_str("Player News")}:
             start_idx = idx
             break
 
@@ -382,13 +426,51 @@ def _find_nbc_news_for_player(query_name: str, max_items: int = 2) -> List[Dict[
                 j += 1
 
             results.append(
-                {"player_query": query_name, "headline": headline, "summary": " ".join(ctx).strip(), "source": "nbc_rotoworld"}
+                {
+                    "headline": headline,
+                    "summary": " ".join(ctx).strip(),
+                }
             )
             i = j
         else:
             i += 1
 
     return results
+
+
+def _find_nbc_news_for_player(player: Dict[str, Any], max_items: int = 2) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Amélioration : on essaye plusieurs URLs NBC dans cet ordre :
+    1) Team player-news (si team abbr connue)
+    2) NBA Player News (non-fantasy)
+    3) Fantasy player-news
+    """
+    full_name = player.get("full_name") or ""
+    team = player.get("team") or {}
+    abbr = (team.get("abbreviation") or "").upper()
+
+    attempted_urls: List[str] = []
+    urls_to_try: List[str] = []
+
+    team_slug = TEAM_SLUG_BY_ABBR.get(abbr)
+    if team_slug:
+        urls_to_try.append(NBC_TEAM_PLAYER_NEWS_TEMPLATE.format(team_slug=team_slug))
+
+    urls_to_try.append(NBC_NBA_PLAYER_NEWS_URL)
+    urls_to_try.append(NBC_FANTASY_PLAYER_NEWS_URL)
+
+    for url in urls_to_try:
+        attempted_urls.append(url)
+        html = _fetch_nbc_html(url)
+        matches = _extract_nbc_matches_from_html(html, full_name, max_items=max_items)
+        if matches:
+            # on annote la source URL pour debug
+            for m in matches:
+                m["source"] = "nbc"
+                m["url"] = url
+            return matches, attempted_urls
+
+    return [], attempted_urls
 
 
 # ============================================================
@@ -417,7 +499,7 @@ def injuries_by_player_id(player_id: int) -> Dict[str, Any]:
     cbs_all = _parse_cbs_injuries(_fetch_cbs_html())
     cbs_matches = [it for it in cbs_all if _normalize_str(it.get("player_name", "")) == player_norm]
 
-    nbc_matches = _find_nbc_news_for_player(full_name, max_items=2)
+    nbc_matches, nbc_attempted_urls = _find_nbc_news_for_player(p, max_items=2)
 
     bdl_injuries = _get_bdl_injuries_for_player_id(player_id)
 
@@ -429,7 +511,7 @@ def injuries_by_player_id(player_id: int) -> Dict[str, Any]:
     if cbs_matches:
         sources_with_info.append("cbs")
     if nbc_matches:
-        sources_with_info.append("nbc_rotoworld")
+        sources_with_info.append("nbc")
 
     aggregated = {
         "status": "flagged" if sources_with_info else "clear",
@@ -444,29 +526,31 @@ def injuries_by_player_id(player_id: int) -> Dict[str, Any]:
             "balldontlie": {"injuries": bdl_injuries},
             "espn": {"injuries": espn_matches, "total_injuries_checked": len(espn_all)},
             "cbs": {"injuries": cbs_matches, "total_injuries_checked": len(cbs_all)},
-            "nbc": {"injuries": nbc_matches},
+            "nbc": {"injuries": nbc_matches, "attempted_urls": nbc_attempted_urls},
         },
     }
 
 
 @app.get("/nbc/raw")
 def nbc_raw() -> Dict[str, Any]:
-    html = _fetch_nbc_news_html()
+    html = _fetch_nbc_html(NBC_FANTASY_PLAYER_NEWS_URL)
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    return {"source": "nbc_rotoworld", "url": NBC_NEWS_URL, "status_code": 200, "content_snippet": text[:500]}
+    text = soup.get_text("\n", strip=True) if html else ""
+    return {"source": "nbc", "url": NBC_FANTASY_PLAYER_NEWS_URL, "status_code": 200 if html else 502, "content_snippet": text[:500]}
 
 
 @app.get("/injuries/nbc")
-def injuries_nbc(name: Optional[str] = None) -> Dict[str, Any]:
+def injuries_nbc(name: str) -> Dict[str, Any]:
+    """
+    Debug simple : on cherche uniquement sur NBA Player News (non-fantasy) + fantasy.
+    (Le vrai usage est /injuries/by-player-id, qui sait la team du joueur.)
+    """
     if not name:
-        html = _fetch_nbc_news_html()
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text("\n", strip=True)
-        return {"source": "nbc_rotoworld", "url": NBC_NEWS_URL, "mode": "snippet_only", "content_snippet": text[:500]}
+        raise HTTPException(status_code=400, detail="name must not be empty")
 
-    items = _find_nbc_news_for_player(name, max_items=3)
-    return {"source": "nbc_rotoworld", "player_query": name, "count": len(items), "items": items}
+    fake_player = {"full_name": name, "team": {"abbreviation": ""}}
+    items, attempted = _find_nbc_news_for_player(fake_player, max_items=3)
+    return {"source": "nbc", "player_query": name, "count": len(items), "items": items, "attempted_urls": attempted}
 
 
 # ============================================================
@@ -486,6 +570,7 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
     .ia-card { padding: 24px 20px 26px; border-radius: 20px; background: #0b1220; border: 1px solid rgba(148,163,184,.35); }
     .ia-title { margin: 0 0 6px; font-size: 24px; font-weight: 700; text-transform: uppercase; text-align: center; }
     .ia-subtitle { margin: 0 0 18px; font-size: 13px; color: #9ca3af; text-align: center; }
+
     .ia-search-row { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; }
     .ia-search { flex: 1; display: flex; gap: 10px; position: relative; }
     .ia-search-input-wrap { flex: 1; position: relative; }
@@ -493,17 +578,48 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
     #ia-search-btn { padding: 11px 16px; border-radius: 10px; border: none; background: #3b82f6; color: #fff; font-weight: 700; cursor: pointer; }
     #ia-search-btn:disabled { opacity: .6; cursor: default; }
     #ia-reset-btn { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(148,163,184,.7); background: rgba(15,23,42,.96); color: #e5e7eb; font-size: 12px; cursor: pointer; white-space: nowrap; }
+
     .ia-suggestions { position: absolute; left: 0; right: 0; top: calc(100% + 4px); max-height: 220px; overflow-y: auto; background: #020617; border-radius: 10px; border: 1px solid rgba(148,163,184,.7); z-index: 50; }
     .ia-suggestion-item { padding: 7px 10px; font-size: 13px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
     .ia-suggestion-item:nth-child(2n) { background: rgba(15,23,42,.9); }
     .ia-suggestion-item:hover { background: rgba(59,130,246,.25); }
     .ia-suggestion-name { font-weight: 600; }
     .ia-suggestion-meta { color: #9ca3af; font-size: 12px; }
+
     .ia-loader { margin: 6px 0 4px; font-size: 13px; display: none; }
     .ia-error { margin: 8px 0 6px; padding: 8px 10px; border-radius: 8px; background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.7); color: #fecaca; font-size: 13px; display: none; }
+
+    /* FICHE JOUEUR */
+    .ia-player-card {
+      display: none;
+      margin-top: 12px;
+      padding: 12px 12px;
+      border-radius: 14px;
+      background: rgba(15,23,42,.96);
+      border: 1px solid rgba(148,163,184,.6);
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .ia-player-left { display: flex; flex-direction: column; gap: 2px; }
+    .ia-player-name { font-size: 16px; font-weight: 800; color: #f9fafb; }
+    .ia-player-meta { font-size: 12px; color: #9ca3af; }
+    .ia-badge {
+      font-size: 11px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(148,163,184,.6);
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      white-space: nowrap;
+    }
+    .ia-badge-clear { background: rgba(34,197,94,.12); border-color: rgba(34,197,94,.45); color: #bbf7d0; }
+    .ia-badge-flagged { background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.45); color: #fecaca; }
+
     .ia-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; margin-top: 12px; }
     @media (max-width: 900px) { .ia-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
     @media (max-width: 600px) { .ia-grid { grid-template-columns: minmax(0,1fr); } }
+
     .ia-col { background: rgba(15,23,42,.97); border-radius: 12px; border: 1px solid rgba(148,163,184,.6); overflow: hidden; }
     .ia-col-header { padding: 6px 9px; border-bottom: 1px solid rgba(148,163,184,.5); background: rgba(30,64,175,.35); }
     .ia-col-label { font-size: 11px; text-transform: uppercase; letter-spacing: .14em; }
@@ -521,7 +637,7 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="ia-shell">
     <div class="ia-card">
       <h1 class="ia-title">NBA Injury Checker</h1>
-      <p class="ia-subtitle">Sélection fiable via player_id (plus d’erreurs Edwards/Johnson).</p>
+      <p class="ia-subtitle">Recherche fiable via player_id (plus d’erreurs d’homonymes).</p>
 
       <div class="ia-search-row">
         <div class="ia-search">
@@ -536,6 +652,14 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div id="ia-loader" class="ia-loader">Recherche en cours...</div>
       <div id="ia-error" class="ia-error"></div>
+
+      <div id="ia-player-card" class="ia-player-card">
+        <div class="ia-player-left">
+          <div id="ia-player-name" class="ia-player-name"></div>
+          <div id="ia-player-meta" class="ia-player-meta"></div>
+        </div>
+        <div id="ia-player-badge" class="ia-badge"></div>
+      </div>
 
       <div id="ia-results" style="display:none;">
         <div class="ia-grid">
@@ -571,6 +695,11 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
       const errorBox = document.getElementById("ia-error");
       const results = document.getElementById("ia-results");
       const suggBox = document.getElementById("ia-suggestions");
+
+      const playerCard = document.getElementById("ia-player-card");
+      const playerNameEl = document.getElementById("ia-player-name");
+      const playerMetaEl = document.getElementById("ia-player-meta");
+      const playerBadgeEl = document.getElementById("ia-player-badge");
 
       const srcBdl = document.querySelector("#ia-src-bdl .ia-col-body");
       const srcEspn = document.querySelector("#ia-src-espn .ia-col-body");
@@ -645,7 +774,7 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
           div.appendChild(right);
 
           div.addEventListener("click", function () {
-            selectedPlayer = p;     // IMPORTANT: garde l'id
+            selectedPlayer = p;
             input.value = p.full_name;
             closeSuggestions();
             searchPlayer();
@@ -678,9 +807,29 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
         return false;
       }
 
+      function renderPlayerCard(data) {
+        const p = data.player || {};
+        const team = p.team || {};
+        const abbr = team.abbreviation || "";
+        const pos = p.position || "";
+        const name = p.full_name || "Joueur";
+
+        playerNameEl.textContent = name;
+        playerMetaEl.textContent = [abbr, pos].filter(Boolean).join(" · ");
+
+        const agg = data.aggregated || {};
+        const status = agg.status || "clear";
+
+        playerBadgeEl.className = "ia-badge " + (status === "flagged" ? "ia-badge-flagged" : "ia-badge-clear");
+        playerBadgeEl.textContent = status === "flagged" ? "flagged" : "clear";
+
+        playerCard.style.display = "flex";
+      }
+
       async function searchPlayer() {
         setError("");
         results.style.display = "none";
+        playerCard.style.display = "none";
         clearSources();
 
         if (!selectedPlayer) {
@@ -712,6 +861,7 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
       function renderResults(data) {
         results.style.display = "block";
         clearSources();
+        renderPlayerCard(data);
 
         const bdlInj = (data.sources?.balldontlie?.injuries || [])[0];
         if (!bdlInj) renderEmpty(srcBdl);
@@ -744,11 +894,19 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         const nbcInj = (data.sources?.nbc?.injuries || [])[0];
-        if (!nbcInj) renderEmpty(srcNbc);
-        else {
+        if (!nbcInj) {
+          // Optionnel : affiche où on a cherché
+          const attempted = data.sources?.nbc?.attempted_urls || [];
+          if (attempted.length) {
+            srcNbc.innerHTML = '<span class="ia-badge-empty">Aucune info (testé: ' + attempted.length + ' URLs)</span>';
+          } else {
+            renderEmpty(srcNbc);
+          }
+        } else {
           srcNbc.innerHTML =
-            '<p class="ia-status">' + (nbcInj.headline || "NBC Rotoworld") + "</p>" +
-            (nbcInj.summary ? '<p class="ia-meta">' + nbcInj.summary + "</p>" : "");
+            '<p class="ia-status">' + (nbcInj.headline || "NBC") + "</p>" +
+            (nbcInj.summary ? '<p class="ia-meta">' + nbcInj.summary + "</p>" : "") +
+            (nbcInj.url ? '<p class="ia-meta">' + nbcInj.url + "</p>" : "");
         }
       }
 
@@ -758,6 +916,7 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
         closeSuggestions();
         setError("");
         results.style.display = "none";
+        playerCard.style.display = "none";
         clearSources();
         loader.style.display = "none";
       }
