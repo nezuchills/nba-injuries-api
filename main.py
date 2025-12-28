@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from typing import Optional, Dict, Any, List, Tuple
@@ -333,7 +333,7 @@ def _parse_cbs_injuries(html: str) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-#                      NBC (faux positifs FIX)
+#                      NBC (optionnel / best effort)
 # ============================================================
 
 NBC_FANTASY_PLAYER_NEWS_URL = "https://www.nbcsports.com/fantasy/basketball/player-news"
@@ -387,18 +387,12 @@ def _fetch_nbc_html(url: str) -> str:
 
 
 def _parse_nbc_player_header_from_tokens(tokens: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    tokens exemple: ["Injury","Anthony","Edwards","MIN","Guard"] ou ["Paolo","Banchero","ORL","Forward"]
-    -> (full_name, team_abbr, position)
-    """
     if not tokens:
         return None, None, None
 
-    # retire préfixes éventuels
     while tokens and tokens[0].lower() in {"injury", "recap", "transaction", "headline"}:
         tokens = tokens[1:]
 
-    # trouve team abbr
     team_idx = None
     for i, t in enumerate(tokens):
         if t.upper() in TEAM_ABBRS:
@@ -410,9 +404,7 @@ def _parse_nbc_player_header_from_tokens(tokens: List[str]) -> Tuple[Optional[st
 
     name_tokens = tokens[:team_idx]
     team_abbr = tokens[team_idx].upper()
-    position = None
-    if team_idx + 1 < len(tokens):
-        position = tokens[team_idx + 1]
+    position = tokens[team_idx + 1] if team_idx + 1 < len(tokens) else None
 
     full_name = " ".join(name_tokens).strip()
     if not full_name:
@@ -421,11 +413,7 @@ def _parse_nbc_player_header_from_tokens(tokens: List[str]) -> Tuple[Optional[st
     return full_name, team_abbr, position
 
 
-def _extract_nbc_matches_from_html(html: str, target_full_name: str, max_items: int = 2) -> List[Dict[str, Any]]:
-    """
-    FIX: on ne matche plus "target_full_name apparaît dans le texte".
-    On matche uniquement si l'entête joueur de l'article == target_full_name.
-    """
+def _extract_nbc_matches_from_html(html: str, target_full_name: str, max_items: int = 1) -> List[Dict[str, Any]]:
     if not html:
         return []
 
@@ -436,17 +424,14 @@ def _extract_nbc_matches_from_html(html: str, target_full_name: str, max_items: 
     target_norm = _normalize_str(target_full_name)
     matches: List[Dict[str, Any]] = []
 
-    # On repère les lignes contenant "Link copied to clipboard"
     for idx, line in enumerate(lines):
         nline = _normalize_str(line)
         if "link copied to clipboard" not in nline:
             continue
 
-        # Cas 1: la ligne contient déjà "Injury ... Name TEAM Pos"
         remainder = re.sub(r"(?i).*link copied to clipboard!?", "", line).strip()
         tokens = remainder.split()
 
-        # Cas 2: sinon, on prend quelques lignes suivantes (souvent prénom/nom/team/pos séparés)
         if not tokens:
             lookahead = []
             for j in range(idx + 1, min(idx + 8, len(lines))):
@@ -460,13 +445,10 @@ def _extract_nbc_matches_from_html(html: str, target_full_name: str, max_items: 
             continue
 
         if _normalize_str(header_name) != target_norm:
-            # IMPORTANT: pas de faux positif (Franz mentionné dans un article de Paolo)
             continue
 
-        # summary: on prend les 8 lignes précédentes (pour éviter de renvoyer un pavé)
         prev = lines[max(0, idx - 10):idx]
-        summary_text = " ".join(prev).strip()
-        summary_text = re.sub(r"\s+", " ", summary_text).strip()
+        summary_text = re.sub(r"\s+", " ", " ".join(prev)).strip()
         if len(summary_text) > 450:
             summary_text = summary_text[-450:]
 
@@ -474,9 +456,6 @@ def _extract_nbc_matches_from_html(html: str, target_full_name: str, max_items: 
             {
                 "headline": f"{header_name} {header_abbr} {header_pos or ''}".strip(),
                 "summary": summary_text,
-                "player_header_name": header_name,
-                "player_header_team": header_abbr,
-                "player_header_position": header_pos,
             }
         )
 
@@ -486,31 +465,31 @@ def _extract_nbc_matches_from_html(html: str, target_full_name: str, max_items: 
     return matches
 
 
-def _find_nbc_news_for_player(player: Dict[str, Any], max_items: int = 2) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _find_nbc_news_for_player(player: Dict[str, Any], max_items: int = 1) -> Tuple[List[Dict[str, Any]], List[str]]:
     full_name = player.get("full_name") or ""
     team = player.get("team") or {}
     abbr = (team.get("abbreviation") or "").upper()
 
-    attempted_urls: List[str] = []
+    attempted: List[str] = []
     urls: List[str] = []
 
-    team_slug = TEAM_SLUG_BY_ABBR.get(abbr)
-    if team_slug:
-        urls.append(NBC_TEAM_PLAYER_NEWS_TEMPLATE.format(team_slug=team_slug))
+    slug = TEAM_SLUG_BY_ABBR.get(abbr)
+    if slug:
+        urls.append(NBC_TEAM_PLAYER_NEWS_TEMPLATE.format(team_slug=slug))
     urls.append(NBC_NBA_PLAYER_NEWS_URL)
     urls.append(NBC_FANTASY_PLAYER_NEWS_URL)
 
     for url in urls:
-        attempted_urls.append(url)
+        attempted.append(url)
         html = _fetch_nbc_html(url)
         items = _extract_nbc_matches_from_html(html, full_name, max_items=max_items)
         if items:
             for it in items:
                 it["url"] = url
                 it["source"] = "nbc"
-            return items, attempted_urls
+            return items, attempted
 
-    return [], attempted_urls
+    return [], attempted
 
 
 # ============================================================
@@ -539,7 +518,7 @@ def injuries_by_player_id(player_id: int) -> Dict[str, Any]:
     cbs_all = _parse_cbs_injuries(_fetch_cbs_html())
     cbs_matches = [it for it in cbs_all if _normalize_str(it.get("player_name", "")) == player_norm]
 
-    nbc_matches, nbc_attempted_urls = _find_nbc_news_for_player(p, max_items=2)
+    nbc_matches, nbc_attempted_urls = _find_nbc_news_for_player(p, max_items=1)
 
     bdl_injuries = _get_bdl_injuries_for_player_id(player_id)
 
@@ -569,17 +548,6 @@ def injuries_by_player_id(player_id: int) -> Dict[str, Any]:
             "nbc": {"injuries": nbc_matches, "attempted_urls": nbc_attempted_urls},
         },
     }
-
-
-@app.get("/injuries/nbc")
-def injuries_nbc(name: str) -> Dict[str, Any]:
-    if not name:
-        raise HTTPException(status_code=400, detail="name must not be empty")
-
-    # debug: on tente NBA Player News + fantasy
-    fake_player = {"full_name": name, "team": {"abbreviation": ""}}
-    items, attempted = _find_nbc_news_for_player(fake_player, max_items=3)
-    return {"source": "nbc", "player_query": name, "count": len(items), "items": items, "attempted_urls": attempted}
 
 
 # ============================================================
@@ -638,6 +606,7 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
       background: #020617;
       border: 1px solid rgba(148,163,184,.35);
       object-fit: contain;
+      display: none;
     }
     .ia-player-text { display: flex; flex-direction: column; gap: 2px; }
     .ia-player-name { font-size: 16px; font-weight: 800; color: #f9fafb; }
@@ -667,15 +636,17 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
     .ia-status { font-weight: 600; }
     .ia-meta { font-size: 12px; color: #9ca3af; }
   </style>
+
   <script>
-    window.__ACTIVE_PLAYERS__ = __ACTIVE_PLAYERS_JSON__;
+    // Injecté côté serveur
+    window.API_BASE = "__API_BASE__";
   </script>
 </head>
 <body>
   <div class="ia-shell">
     <div class="ia-card">
       <h1 class="ia-title">NBA Injury Checker</h1>
-      <p class="ia-subtitle">Sélection fiable via player_id (et NBC sans faux positifs).</p>
+      <p class="ia-subtitle">Widget stable (chargement joueurs via API, player_id partout).</p>
 
       <div class="ia-search-row">
         <div class="ia-search">
@@ -683,12 +654,12 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
             <input id="ia-player-input" type="text" placeholder="Tape puis clique une suggestion" autocomplete="off" />
             <div id="ia-suggestions" class="ia-suggestions" style="display:none;"></div>
           </div>
-          <button id="ia-search-btn">Chercher</button>
+          <button id="ia-search-btn" disabled>Chargement...</button>
         </div>
         <button id="ia-reset-btn" type="button">Réinitialiser</button>
       </div>
 
-      <div id="ia-loader" class="ia-loader">Recherche en cours...</div>
+      <div id="ia-loader" class="ia-loader">Chargement...</div>
       <div id="ia-error" class="ia-error"></div>
 
       <div id="ia-player-card" class="ia-player-card">
@@ -722,12 +693,14 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
         </div>
       </div>
+
     </div>
   </div>
 
   <script>
     (function () {
-      const ACTIVE_PLAYERS = window.__ACTIVE_PLAYERS__ || [];
+      const API_BASE = (window.API_BASE || "").replace(/\/+$/, "");
+      let ACTIVE_PLAYERS = [];
 
       const input = document.getElementById("ia-player-input");
       const searchBtn = document.getElementById("ia-search-btn");
@@ -751,7 +724,6 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
       let selectedPlayer = null;
       let suggTimeout = null;
 
-      // Logos ESPN CDN: https://a.espncdn.com/i/teamlogos/nba/500/{abbr}.png
       function teamLogoUrl(abbr) {
         if (!abbr) return "";
         return "https://a.espncdn.com/i/teamlogos/nba/500/" + abbr.toLowerCase() + ".png";
@@ -775,9 +747,10 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
       }
 
-      function setLoading(isLoading) {
+      function setLoading(isLoading, label) {
         loader.style.display = isLoading ? "block" : "none";
-        searchBtn.disabled = isLoading;
+        if (label) loader.textContent = label;
+        searchBtn.disabled = isLoading || !ACTIVE_PLAYERS.length;
       }
 
       function clearSources() {
@@ -883,6 +856,30 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
         playerCard.style.display = "flex";
       }
 
+      async function loadPlayers() {
+        setError("");
+        setLoading(true, "Chargement joueurs...");
+        searchBtn.textContent = "Chargement...";
+
+        try {
+          const url = API_BASE + "/players/active/local";
+          const res = await fetch(url, { method: "GET" });
+          if (!res.ok) throw new Error("players load failed: " + res.status);
+          const data = await res.json();
+          ACTIVE_PLAYERS = data.players || [];
+          if (!ACTIVE_PLAYERS.length) throw new Error("empty players list");
+          searchBtn.textContent = "Chercher";
+          searchBtn.disabled = false;
+          setLoading(false);
+        } catch (e) {
+          console.error(e);
+          setError("Impossible de charger la liste des joueurs (service en veille ou erreur). Recharge la page.");
+          setLoading(false);
+          searchBtn.textContent = "Chercher";
+          searchBtn.disabled = true;
+        }
+      }
+
       async function searchPlayer() {
         setError("");
         results.style.display = "none";
@@ -897,10 +894,11 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
           }
         }
 
-        setLoading(true);
+        setLoading(true, "Recherche en cours...");
         try {
-          const url = "/injuries/by-player-id?player_id=" + encodeURIComponent(selectedPlayer.id);
+          const url = API_BASE + "/injuries/by-player-id?player_id=" + encodeURIComponent(selectedPlayer.id);
           const res = await fetch(url, { method: "GET" });
+
           if (!res.ok) {
             const txt = await res.text();
             throw new Error("API error " + res.status + " " + txt);
@@ -909,7 +907,7 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
           renderResults(data);
         } catch (e) {
           console.error(e);
-          setError("Erreur lors de la récupération. Réessaie.");
+          setError("Erreur lors de la récupération. Réessaie (ou le service Render est en veille).");
         } finally {
           setLoading(false);
         }
@@ -951,9 +949,8 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         const nbcInj = (data.sources?.nbc?.injuries || [])[0];
-        if (!nbcInj) {
-          renderEmpty(srcNbc);
-        } else {
+        if (!nbcInj) renderEmpty(srcNbc);
+        else {
           srcNbc.innerHTML =
             '<p class="ia-status">' + (nbcInj.headline || "NBC") + "</p>" +
             (nbcInj.summary ? '<p class="ia-meta">' + nbcInj.summary + "</p>' : "") +
@@ -990,6 +987,9 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.addEventListener("click", function (e) {
         if (!suggBox.contains(e.target) && e.target !== input) closeSuggestions();
       });
+
+      // Init
+      loadPlayers();
     })();
   </script>
 </body>
@@ -998,7 +998,17 @@ WIDGET_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 
 @app.get("/widget", response_class=HTMLResponse)
-def widget() -> str:
-    _load_active_players()
-    players_json = json.dumps(ACTIVE_PLAYERS, ensure_ascii=False)
-    return WIDGET_HTML_TEMPLATE.replace("__ACTIVE_PLAYERS_JSON__", players_json)
+def widget(request: Request) -> str:
+    # Important: base URL Render (même si le widget est embed sur Carrd hors iframe)
+    api_base = str(request.base_url).rstrip("/")
+    return WIDGET_HTML_TEMPLATE.replace("__API_BASE__", api_base)
+
+
+# ============================================================
+#                    BASIC ROOT ENDPOINTS
+# ============================================================
+
+@app.get("/favicon.ico")
+def favicon():
+    # Optionnel: évite le bruit 404 dans la console.
+    return HTMLResponse(content="", status_code=204)
